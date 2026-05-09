@@ -399,15 +399,28 @@ class SettingsTabWidget(QWidget):
         self.worker_spin.setRange(1, 8)
         self.worker_spin.valueChanged.connect(lambda v: self.config.set('render_workers', v))
         layout.addRow("Render Workers:", self.worker_spin)
-        
+
+        # Output Directory
         out_layout = QHBoxLayout()
         self.out_dir_edit = QLineEdit()
-        self.out_dir_edit.textChanged.connect(lambda t: self.config.set('output_dir', t))
+        self.out_dir_edit.setText(self.config.get('output_dir', 'Output'))
+        self.out_dir_edit.editingFinished.connect(lambda: self.config.set('output_dir', self.out_dir_edit.text()))
         btn_browse = QPushButton("Browse...")
         btn_browse.clicked.connect(self.browse_output_dir)
         out_layout.addWidget(self.out_dir_edit)
         out_layout.addWidget(btn_browse)
         layout.addRow("Output Dir:", out_layout)
+
+        # Projects Root (Missing from UI but in config)
+        proj_layout = QHBoxLayout()
+        self.proj_root_edit = QLineEdit()
+        self.proj_root_edit.setText(self.config.get('projects_root', 'Projects'))
+        self.proj_root_edit.editingFinished.connect(lambda: self.config.set('projects_root', self.proj_root_edit.text()))
+        btn_browse_proj = QPushButton("Browse...")
+        btn_browse_proj.clicked.connect(lambda: self.browse_generic(self.proj_root_edit, True))
+        proj_layout.addWidget(self.proj_root_edit)
+        proj_layout.addWidget(btn_browse_proj)
+        layout.addRow("Projects Root:", proj_layout)
 
         self.trans_spin = QDoubleSpinBox()
         self.trans_spin.setRange(0.0, 10.0)
@@ -959,7 +972,7 @@ class NewProjectTabWidget(QWidget):
         self.name_input.setPlaceholderText("My Awesome Video")
         
         self.type_combo = QComboBox()
-        self.type_combo.addItems(["Text Slide", "Image Slide", "Blank Slide"])
+        self.type_combo.addItems(["Blank Slide", "Text Slide", "Image Slide"])
         self.type_combo.currentIndexChanged.connect(self.on_type_changed)
         
         self.content_input = QLineEdit()
@@ -1155,6 +1168,31 @@ class SlideEditorTabWidget(QWidget):
         action_layout.addStretch()
         action_layout.addWidget(self.btn_save)
         self.layout.addLayout(action_layout)
+
+         # =================================================================
+        # KEYBOARD SHORTCUTS
+        # =================================================================
+        
+        # Ctrl+N: Add Blank Slide
+        self.shortcut_add_blank = QShortcut(QKeySequence("Ctrl+N"), self)
+        self.shortcut_add_blank.activated.connect(self.add_blank_slide_quick)
+
+        # Ctrl+F: Move Prev Slide
+        self.shortcut_add_custom = QShortcut(QKeySequence("Ctrl+F"), self)
+        self.shortcut_add_custom.activated.connect(self.prev_slide)
+
+         # Ctrl+G: Move Next Slide
+        self.shortcut_add_custom = QShortcut(QKeySequence("Ctrl+G"), self)
+        self.shortcut_add_custom.activated.connect(self.next_slide)
+
+        # Ctrl+D: Delete Current Slide
+        self.shortcut_delete = QShortcut(QKeySequence("Ctrl+D"), self)
+        self.shortcut_delete.activated.connect(self.delete_current_slide)
+        
+        # Ctrl+S: Save Current Slide
+        self.shortcut_save = QShortcut(QKeySequence("Ctrl+S"), self)
+        self.shortcut_save.activated.connect(self.save_current_slide)
+
         
         self.load_project()
 

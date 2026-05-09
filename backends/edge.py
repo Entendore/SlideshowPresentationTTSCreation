@@ -343,9 +343,12 @@ class EdgeTTSBackend(BaseTTSBackend):
         
         def on_rate_changed(value):
             rate_label.setText(f"{value}%")
-            config.set("edge_rate", f"{value}%")
+
+        def on_rate_released():
+            config.set("edge_rate", f"{rate_slider.value()}%")
         
         rate_slider.valueChanged.connect(on_rate_changed)
+        rate_slider.sliderReleased.connect(on_rate_released)
         rate_layout.addWidget(rate_slider)
         rate_layout.addWidget(rate_label)
         layout.addRow("Speech Rate:", rate_layout)
@@ -364,9 +367,12 @@ class EdgeTTSBackend(BaseTTSBackend):
         
         def on_pitch_changed(value):
             pitch_label.setText(f"{value:+d}Hz")
-            config.set("edge_pitch", f"{value:+d}Hz")
+        
+        def on_pitch_released():
+            config.set("edge_pitch", f"{pitch_slider.value():+d}Hz")
         
         pitch_slider.valueChanged.connect(on_pitch_changed)
+        pitch_slider.sliderReleased.connect(on_pitch_released)
         pitch_layout.addWidget(pitch_slider)
         pitch_layout.addWidget(pitch_label)
         layout.addRow("Pitch:", pitch_layout)
@@ -379,6 +385,9 @@ class EdgeTTSBackend(BaseTTSBackend):
         volume_slider.setValue(0)  # Default to 0 (no change)
         volume_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         volume_slider.setTickInterval(25)
+
+        def on_volume_released():
+            config.set("edge_volume", f"{volume_slider.value():+d}%")
         
         # Parse current volume value
         current_volume = config.get("edge_volume", "+0%")
@@ -394,9 +403,12 @@ class EdgeTTSBackend(BaseTTSBackend):
         
         def on_volume_changed(value):
             volume_label.setText(f"{value:+d}%")
-            config.set("edge_volume", f"{value:+d}%")
+
+        def on_volume_released():
+            config.set("edge_volume", f"{volume_slider.value():+d}%")
         
         volume_slider.valueChanged.connect(on_volume_changed)
+        volume_slider.sliderReleased.connect(on_volume_released)
         volume_layout.addWidget(volume_slider)
         volume_layout.addWidget(volume_label)
         layout.addRow("Volume:", volume_layout)

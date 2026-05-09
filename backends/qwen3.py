@@ -196,14 +196,13 @@ class Qwen3Backend(BaseTTSBackend):
     # =================================================================
     # UI GENERATION FACTORY
     # =================================================================
-
     @staticmethod
     def get_settings_widget(mode: str, config, parent=None) -> QWidget:
         widget = QWidget(parent)
         layout = QFormLayout(widget)
         
         # ---------------------------------------------------------
-        # MODE 1: Voice Custom (Preset Speakers)
+        # MODE 1: Voice Custom
         # ---------------------------------------------------------
         if mode == "voice_custom":
             layout.addRow(QLabel("<b>Voice Custom Configuration</b>"))
@@ -212,13 +211,14 @@ class Qwen3Backend(BaseTTSBackend):
             speaker_edit = QLineEdit()
             speaker_edit.setText(config.get("qwen3_speaker", "Vivian"))
             speaker_edit.setPlaceholderText("e.g., Vivian, Ryan")
-            speaker_edit.textChanged.connect(lambda t: config.set("qwen3_speaker", t))
+            # FIX: Save on finish editing
+            speaker_edit.editingFinished.connect(lambda: config.set("qwen3_speaker", speaker_edit.text()))
             layout.addRow("Speaker Name:", speaker_edit)
             
             instruct_edit = QLineEdit()
             instruct_edit.setText(config.get("qwen3_instruct", ""))
             instruct_edit.setPlaceholderText("e.g., 'Speak slowly and sadly'")
-            instruct_edit.textChanged.connect(lambda t: config.set("qwen3_instruct", t))
+            instruct_edit.editingFinished.connect(lambda: config.set("qwen3_instruct", instruct_edit.text()))
             layout.addRow("Style Instruction:", instruct_edit)
             
             lang_combo = QComboBox()
@@ -228,7 +228,7 @@ class Qwen3Backend(BaseTTSBackend):
             layout.addRow("Language:", lang_combo)
 
         # ---------------------------------------------------------
-        # MODE 2: Voice Clone (User Reference)
+        # MODE 2: Voice Clone
         # ---------------------------------------------------------
         elif mode == "voice_clone":
             layout.addRow(QLabel("<b>Voice Clone Configuration</b>"))
@@ -238,7 +238,7 @@ class Qwen3Backend(BaseTTSBackend):
             ref_audio_edit = QLineEdit()
             ref_audio_edit.setText(config.get("qwen3_ref_audio", ""))
             ref_audio_edit.setPlaceholderText("Path to reference .wav file")
-            ref_audio_edit.textChanged.connect(lambda t: config.set("qwen3_ref_audio", t))
+            ref_audio_edit.editingFinished.connect(lambda: config.set("qwen3_ref_audio", ref_audio_edit.text()))
             
             btn_browse = QPushButton("...")
             btn_browse.setMaximumWidth(30)
@@ -251,7 +251,7 @@ class Qwen3Backend(BaseTTSBackend):
             ref_text_edit = QLineEdit()
             ref_text_edit.setText(config.get("qwen3_ref_text", ""))
             ref_text_edit.setPlaceholderText("Transcript of reference audio")
-            ref_text_edit.textChanged.connect(lambda t: config.set("qwen3_ref_text", t))
+            ref_text_edit.editingFinished.connect(lambda: config.set("qwen3_ref_text", ref_text_edit.text()))
             layout.addRow("Reference Text:", ref_text_edit)
             
             lang_combo = QComboBox()
@@ -261,23 +261,24 @@ class Qwen3Backend(BaseTTSBackend):
             layout.addRow("Language:", lang_combo)
 
         # ---------------------------------------------------------
-        # MODE 3: Voice Design (Generate Reference)
+        # MODE 3: Voice Design
         # ---------------------------------------------------------
         elif mode == "voice_design":
             layout.addRow(QLabel("<b>Voice Design Configuration</b>"))
             layout.addRow(QLabel("<i>Model: Qwen3-TTS-12Hz-1.7B-VoiceDesign</i>"))
-            layout.addRow(QLabel("<i>Generates a voice reference file automatically.</i>"))
             
             desc_edit = QPlainTextEdit()
             desc_edit.setPlaceholderText("Describe the voice (e.g., 'A deep male voice, speaking slowly')")
             desc_edit.setMaximumHeight(100)
             desc_edit.setPlainText(config.get("qwen3_vd_description", ""))
+            # Note: QPlainTextEdit doesn't have editingFinished, we connect textChanged for autosave here
+            # but it's acceptable for a description field to update live.
             desc_edit.textChanged.connect(lambda: config.set("qwen3_vd_description", desc_edit.toPlainText()))
             layout.addRow("Voice Description:", desc_edit)
             
             save_name_edit = QLineEdit()
             save_name_edit.setText(config.get("qwen3_vd_save_name", "my_designed_voice"))
-            save_name_edit.textChanged.connect(lambda t: config.set("qwen3_vd_save_name", t))
+            save_name_edit.editingFinished.connect(lambda: config.set("qwen3_vd_save_name", save_name_edit.text()))
             layout.addRow("Save Reference As:", save_name_edit)
 
             lang_combo = QComboBox()
@@ -289,7 +290,7 @@ class Qwen3Backend(BaseTTSBackend):
         return widget
 
     @staticmethod
-    def _browse_audio(line_edit, text_edit):
+    def _browse_audio(line_edit, text_edit, config):
         fname, _ = QFileDialog.getOpenFileName(
             None, 
             "Select Reference Audio", 
@@ -298,6 +299,8 @@ class Qwen3Backend(BaseTTSBackend):
         )
         if fname:
             line_edit.setText(fname)
+
+            config.set("qwen3_ref_audio",fname)
             
             if text_edit:
                 # 1. Construct the expected path (e.g. /path/to/whipservoice.txt)
