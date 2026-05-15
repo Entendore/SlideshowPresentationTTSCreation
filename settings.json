@@ -31,7 +31,7 @@
     "qwen3_vd_save_name": "my_designed_voice",
     "qwen3_language": "English",
     "edge_language": "English",
-    "edge_voice": "en-US-AndrewNeural",
+    "edge_voice": "en-US-AndrewMultilingualNeural",
     "edge_rate": "+0%",
     "edge_pitch": "+0Hz",
     "edge_volume": "+0%",
