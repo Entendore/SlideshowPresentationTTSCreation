@@ -1,6 +1,7 @@
 # config.py
 import os
 import json
+import copy
 from utils import logger
 
 class AppConfig:
@@ -10,6 +11,7 @@ class AppConfig:
     Auto-saves to settings.json on change and auto-loads on instantiation.
     """
     _instance = None
+    _initialized = False
 
     DEFAULT_CONFIG = {
         # ------------------------------------------------------------------
@@ -32,8 +34,6 @@ class AppConfig:
         # Render Settings
         # ------------------------------------------------------------------
         "render_workers": 3,
-        "enable_zoom": False,
-        "zoom_factor": 1.1,
         
         # ------------------------------------------------------------------
         # HUGGING FACE CACHE & DATASETS
@@ -102,13 +102,20 @@ class AppConfig:
     }
 
     def __new__(cls):
-        """Singleton implementation: ensures only one instance exists."""
         if cls._instance is None:
             cls._instance = super(AppConfig, cls).__new__(cls)
-            cls._instance.config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
-            cls._instance.settings = cls.DEFAULT_CONFIG.copy()
-            cls._instance.load()
+            cls._initialized = False
         return cls._instance
+    
+    def __init__(self):
+        """Only run initialization once, even if AppConfig() is called multiple times."""
+        if not AppConfig._initialized:
+            self.config_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "settings.json"
+            )
+            self.settings = copy.deepcopy(self.DEFAULT_CONFIG)
+            self.load()
+            AppConfig._initialized = True
 
     def load(self):
         """Load configuration from settings.json."""

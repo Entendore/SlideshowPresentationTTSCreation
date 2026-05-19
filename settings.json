@@ -8,8 +8,6 @@
     "projects_root": "Projects",
     "output_dir": "Output",
     "render_workers": 3,
-    "enable_zoom": false,
-    "zoom_factor": 1.1,
     "hf_cache_dir": "E:\\cacheAI",
     "hf_datasets_dir": "E:\\cacheAI",
     "hf_use_symlinks": false,
@@ -41,5 +39,7 @@
     "chunk_min_chars": 50,
     "chunk_audio_overlap_ms": 0,
     "chunk_warn_threshold": 1000,
+    "enable_zoom": false,
+    "zoom_factor": 1.1,
     "instruction_folder_root": ""
 }

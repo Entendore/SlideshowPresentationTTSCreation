@@ -35,176 +35,463 @@ import backends
 # CUSTOM WIDGETS
 # =================================================================
 
+# =================================================================
+# MODULAR SUB-COMPONENTS
+# =================================================================
+
+class StatusStrip(QFrame):
+    """
+    Left-edge colored strip indicating project status.
+    Self-contained: accepts a color and renders itself.
+    """
+    STRIP_WIDTH = 5
+    STRIP_RADIUS = "3px 0px 0px 3px"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(self.STRIP_WIDTH)
+        self._color = "#555555"
+        self._apply_style()
+
+    def set_color(self, hex_color: str):
+        self._color = hex_color
+        self._apply_style()
+
+    def _apply_style(self):
+        self.setStyleSheet(
+            f"background-color: {self._color}; "
+            f"border-top-left-radius: {self.STRIP_RADIUS.split()[0]}; "
+            f"border-bottom-left-radius: {self.STRIP_RADIUS.split()[2]};"
+        )
+
+
+class StatusBadge(QLabel):
+    """
+    Compact status indicator badge (e.g. "DONE", "WAIT", "ERR").
+    Self-contained: accepts label text, bg, text, and border colors.
+    """
+    BADGE_W = 52
+    BADGE_H = 22
+    BADGE_RADIUS = 11
+    BADGE_FONT_SIZE = 10
+    BADGE_FONT_WEIGHT = "bold"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setFixedSize(self.BADGE_W, self.BADGE_H)
+        self._bg = "#444444"
+        self._fg = "#999999"
+        self._border = "#555555"
+        self._apply_style()
+
+    def set_appearance(self, text: str, bg: str, fg: str, border: str):
+        self.setText(text)
+        self._bg = bg
+        self._fg = fg
+        self._border = border
+        self._apply_style()
+
+    def _apply_style(self):
+        self.setStyleSheet(f"""
+            QLabel {{
+                background-color: {self._bg};
+                color: {self._fg};
+                border-radius: {self.BADGE_RADIUS}px;
+                font-size: {self.BADGE_FONT_SIZE}px;
+                font-weight: {self.BADGE_FONT_WEIGHT};
+                border: 1px solid {self._border};
+            }}
+        """)
+
+
+class MetaLabel(QLabel):
+    """
+    Two-line content block: title (bold, larger) + detail (muted, smaller).
+    Self-contained with its own layout.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWordWrap(True)
+        self.setStyleSheet("background: transparent;")
+
+    def set_title(self, text: str, color: str = "#e0e0e0",
+                  size: int = 14, weight: str = "bold"):
+        self.setText(text)
+        self.setStyleSheet(
+            f"color: {color}; font-size: {size}px; "
+            f"font-weight: {weight}; background: transparent;"
+        )
+
+
+class DetailRow(QWidget):
+    """
+    Row below the title showing status detail and the badge.
+    [detail_text ─────── stretch ─────── BADGE]
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self.detail = QLabel()
+        self.detail.setStyleSheet("background: transparent;")
+        self.detail.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                  QSizePolicy.Policy.Preferred)
+
+        self.badge = StatusBadge()
+
+        layout.addWidget(self.detail, stretch=1)
+        layout.addWidget(self.badge)
+
+    def set_detail(self, text: str, color: str = "#888888",
+                   size: int = 11, weight: str = "normal"):
+        self.detail.setText(text)
+        self.detail.setStyleSheet(
+            f"color: {color}; font-size: {size}px; "
+            f"font-weight: {weight}; background: transparent;"
+        )
+
+    def set_badge(self, text: str, bg: str, fg: str, border: str):
+        self.badge.set_appearance(text, bg, fg, border)
+
+
+# =================================================================
+# STATUS THEME RESOLVER (Centralized Status → Color Mapping)
+# =================================================================
+
+class StatusTheme:
+    """
+    Single source of truth for status → color mapping.
+    All visual components query this instead of hardcoding colors.
+    """
+    # Strip colors
+    STRIP = {
+        "default":  "#555555",
+        "unknown":  "#666666",
+        "queued":   "#f0ad4e",
+        "rendering":"#0078d4",
+        "ready":    "#28a745",
+        "error":    "#dc3545",
+    }
+
+    # Badge colors: (bg, text, border)
+    BADGE = {
+        "default":  ("#444444", "#999999", "#555555"),
+        "unknown":  ("#3a3a3a", "#888888", "#4a4a4a"),
+        "queued":   ("#f0ad4e", "#1a1a1a", "#d99a3e"),
+        "rendering":("#0078d4", "#ffffff", "#006abc"),
+        "ready":    ("#28a745", "#ffffff", "#1e7e34"),
+        "error":    ("#dc3545", "#ffffff", "#bd2130"),
+    }
+
+    # Badge labels
+    LABEL = {
+        "default":  "NEW",
+        "unknown":  "TODO",
+        "queued":   "WAIT",
+        "rendering":"...",
+        "ready":    "DONE",
+        "error":    "ERR",
+    }
+
+    # Detail text defaults
+    DETAIL_COLOR = {
+        "default":  "#888888",
+        "unknown":  "#888888",
+        "queued":   "#c8a460",
+        "rendering":"#66a3d2",
+        "ready":    "#6abf7b",
+        "error":    "#e87878",
+    }
+
+    @classmethod
+    def strip_color(cls, status: str) -> str:
+        return cls.STRIP.get(status, cls.STRIP["default"])
+
+    @classmethod
+    def badge_colors(cls, status: str) -> tuple:
+        return cls.BADGE.get(status, cls.BADGE["default"])
+
+    @classmethod
+    def badge_label(cls, status: str) -> str:
+        return cls.LABEL.get(status, cls.LABEL["default"])
+
+    @classmethod
+    def detail_color(cls, status: str) -> str:
+        return cls.DETAIL_COLOR.get(status, cls.DETAIL_COLOR["default"])
+
+
+# =================================================================
+# SELECTION STATE (Decoupled from visual)
+# =================================================================
+
+class SelectionState:
+    """
+    Tracks which items are selected in the list.
+    Single-select by default; can be extended for multi-select.
+    """
+    def __init__(self):
+        self._selected_path: str = ""
+
+    @property
+    def selected_path(self) -> str:
+        return self._selected_path
+
+    def select(self, path: str):
+        self._selected_path = path
+
+    def deselect_all(self):
+        self._selected_path = ""
+
+    def is_selected(self, path: str) -> bool:
+        return self._selected_path == path
+
+
+# =================================================================
+# PROJECT LIST ITEM WIDGET (Modular Composition)
+# =================================================================
+
 class ProjectListItemWidget(QWidget):
-    """Custom widget for items in the project library list."""
-    def __init__(self, name, path, parent=None):
+    """
+    A single project row in the library list.
+
+    Architecture:
+        ┌────┬──────────────────────────────┐
+        │    │  Title                        │
+        │ S  │  Detail text ─────── [BADGE] │
+        │    │                               │
+        └────┴──────────────────────────────┘
+         Strip   Content (MetaLabel + DetailRow)
+
+    Selection is self-managed via set_selected() — the widget
+    updates its own background/border without external help.
+    """
+
+    ITEM_HEIGHT = 62
+    ITEM_RADIUS = 6
+    ITEM_MARGIN = "2px 4px 2px 4px"
+
+    # Background states
+    BG_NORMAL    = "#2d2d2d"
+    BG_HOVER     = "#353535"
+    BG_SELECTED  = "#1f3a5f"
+    BG_SEL_HOVER = "#264a73"
+
+    # Border states
+    BORDER_NORMAL   = "1px solid #3a3a3a"
+    BORDER_SELECTED = "1px solid #0078d4"
+
+    # Title color states
+    TITLE_NORMAL   = "#e0e0e0"
+    TITLE_SELECTED = "#ffffff"
+
+    def __init__(self, name: str, path: str,
+                 selection_state: SelectionState, parent=None):
         super().__init__(parent)
         self.name = name
         self.path = path
-        th = get_theme()
-        item_th = th["list_item"]
-        strip_th = th["status_strip"]
-        badge_th = th["badge"]
-        text_th = th["text"]
-        content_margins = th["content_margins"]
-        content_spacing = th["content_spacing"]
+        self._sel_state = selection_state
+        self._hovered = False
+        self._current_status = "unknown"
+        self._progress_pct = 0
+        self._detail_text = "Not Rendered"
 
-        self.setObjectName("projectListItemWidget")
-        self.setStyleSheet(f"""
-            #projectListItemWidget {{
-                background-color: {item_th["background"]};
-                border-bottom: {item_th["border_bottom"]};
-                border-radius: {item_th["border_radius"]}px;
-                margin: {item_th["margin"]};
-            }}
-        """)
-        self.setAutoFillBackground(True)
-        self.setFixedHeight(item_th["height"])
+        self.setObjectName("projectItem")
+        self.setFixedHeight(self.ITEM_HEIGHT)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMouseTracking(True)
 
-        self.layout = QHBoxLayout(self)
-        self.layout.setContentsMargins(0, 0, 0, 0)
-        self.layout.setSpacing(0)
+        self._build_ui()
+        self._apply_visual_state()
 
-        # Status Strip (Left border)
-        self.status_strip = QFrame()
-        self.status_strip.setFixedWidth(strip_th["width"])
-        self.status_strip.setStyleSheet(
-            f"background-color: {strip_th['colors']['default']}; "
-            f"border-top-left-radius: {strip_th['border_radius'].split()[0]}; "
-            f"border-bottom-left-radius: {strip_th['border_radius'].split()[2]};"
-        )
+    # ── Construction ─────────────────────────────────────────────
 
-        content_layout = QHBoxLayout()
-        content_layout.setContentsMargins(*content_margins)
-        content_layout.setSpacing(content_spacing)
+    def _build_ui(self):
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
-        text_layout = QVBoxLayout()
-        text_layout.setSpacing(4)
+        # Strip
+        self.strip = StatusStrip()
+        outer.addWidget(self.strip)
 
-        self.lbl_title = QLabel(name)
-        self.lbl_title.setStyleSheet(
-            f"color: {text_th['title']['color']}; "
-            f"font-size: {text_th['title']['font_size']}px; "
-            f"font-weight: {text_th['title']['font_weight']}; "
-            f"background: transparent;"
-        )
-        self.lbl_title.setWordWrap(True)
+        # Content
+        content = QVBoxLayout()
+        content.setContentsMargins(12, 8, 12, 8)
+        content.setSpacing(4)
 
-        self.lbl_meta = QLabel("No Data")
-        self.lbl_meta.setStyleSheet(
-            f"color: {text_th['meta']['color']}; "
-            f"font-size: {text_th['meta']['font_size']}px; "
-            f"font-weight: {text_th['meta']['font_weight']}; "
-            f"background: transparent;"
-        )
+        self.title_label = MetaLabel()
+        self.title_label.set_title(self.name)
 
-        text_layout.addWidget(self.lbl_title)
-        text_layout.addWidget(self.lbl_meta)
+        self.detail_row = DetailRow()
+        self.detail_row.set_detail("Not Rendered")
+        self.detail_row.set_badge("TODO", "#3a3a3a", "#888888", "#4a4a4a")
+
+        content.addWidget(self.title_label)
+        content.addWidget(self.detail_row)
+
+        outer.addLayout(content, stretch=1)
+
+    # ── Public API ───────────────────────────────────────────────
+
+    def set_selected(self, selected: bool):
+        """Set selection state and update visuals immediately."""
+        if selected:
+            self._sel_state.select(self.path)
+        # We don't deselect here — that's the SelectionManager's job
+        self._apply_visual_state()
+
+    def is_selected(self) -> bool:
+        return self._sel_state.is_selected(self.path)
+
+    def update_status(self, status: str, progress_pct: int = 0,
+                      detail_text: str = ""):
+        """Update the project's rendering status and refresh all sub-components."""
+        self._current_status = status
+        self._progress_pct = progress_pct
+        self._detail_text = detail_text or self._default_detail(status)
+
+        # Strip
+        self.strip.set_color(StatusTheme.strip_color(status))
 
         # Badge
-        self.lbl_status_badge = QLabel("NEW")
-        self.lbl_status_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_status_badge.setFixedWidth(badge_th["width"])
-        self.lbl_status_badge.setFixedHeight(badge_th["height"])
-        self.lbl_status_badge.setStyleSheet(f"""
-            QLabel {{
-                background-color: {badge_th['colors']['default_bg']};
-                color: {badge_th['colors']['default_text']};
-                border-radius: {badge_th['border_radius']}px;
-                font-size: {badge_th['font_size']}px;
-                font-weight: {badge_th['font_weight']};
-                border: 1px solid {badge_th['colors']['default_border']};
-            }}
-        """)
+        bg, fg, border = StatusTheme.badge_colors(status)
+        label = self._badge_label(status, progress_pct)
+        self.detail_row.set_badge(label, bg, fg, border)
 
-        content_layout.addLayout(text_layout)
-        content_layout.addStretch()
-        content_layout.addWidget(self.lbl_status_badge)
+        # Detail text
+        det_color = StatusTheme.detail_color(status)
+        self.detail_row.set_detail(self._detail_text, color=det_color)
 
-        self.layout.addWidget(self.status_strip)
-        self.layout.addLayout(content_layout)
-        self.update_status("unknown")
+    def current_status(self) -> str:
+        return self._current_status
 
-    def set_selected_visual(self, selected: bool):
-        th = get_theme()
-        item_th = th["list_item"]
-        bg = item_th["background_selected"] if selected else item_th["background"]
-        border = item_th["border_selected"] if selected else item_th["border_bottom"]
-        self.setStyleSheet(f"""
-            #projectListItemWidget {{
-                background-color: {bg};
-                border-bottom: {border};
-                border-radius: {item_th["border_radius"]}px;
-                margin: {item_th["margin"]};
-            }}
-        """)
+    # ── Visual State Engine ──────────────────────────────────────
 
-    def update_status(self, status, progress_pct=0, detail_text=""):
-        th = get_theme()
-        strip_th = th["status_strip"]
-        badge_th = th["badge"]
-        text_th = th["text"]
+    def _apply_visual_state(self):
+        """Compute and apply background, border, and title color
+        based on (selected, hovered) combination."""
+        sel = self.is_selected()
+        hov = self._hovered
 
-        strip_color = strip_th["colors"].get("default")
-        badge_bg = badge_th["colors"]["default_bg"]
-        badge_text = badge_th["colors"]["default_text"]
-        badge_border = badge_th["colors"]["default_border"]
-        badge_label = "NEW"
-
-        if not detail_text: detail_text = "Not Rendered"
-
-        if status == "rendering":
-            strip_color = strip_th["colors"].get("rendering")
-            badge_bg = strip_color
-            badge_text = "#ffffff"
-            badge_label = f"{progress_pct}%"
-            if "Not Rendered" in detail_text: detail_text = "Processing..."
-        elif status == "queued":
-            strip_color = strip_th["colors"].get("queued")
-            badge_bg = strip_color
-            badge_text = "#ffffff"
-            badge_label = "WAIT"
-        elif status == "ready":
-            strip_color = strip_th["colors"].get("ready")
-            badge_bg = strip_color
-            badge_text = "#ffffff"
-            badge_label = "DONE"
-        elif status == "error":
-            strip_color = strip_th["colors"].get("error")
-            badge_bg = strip_color
-            badge_text = "#ffffff"
-            badge_label = "ERR"
-            detail_text = "Error - Check Logs"
-        elif status == "unknown":
-            strip_color = strip_th["colors"].get("unknown")
-            badge_bg = strip_color
-            badge_text = "#ffffff"
-            badge_label = "TODO"
-            detail_text = "Not Rendered"
-
-        self.status_strip.setStyleSheet(
-            f"background-color: {strip_color}; "
-            f"border-top-left-radius: {strip_th['border_radius'].split()[0]}; "
-            f"border-bottom-left-radius: {strip_th['border_radius'].split()[2]};"
-        )
-        self.lbl_status_badge.setText(badge_label)
-        self.lbl_status_badge.setStyleSheet(f"""
-            QLabel {{
-                background-color: {badge_bg};
-                color: {badge_text};
-                border-radius: {badge_th['border_radius']}px;
-                font-size: {badge_th['font_size']}px;
-                font-weight: {badge_th['font_weight']};
-                border: 1px solid {strip_color};
-            }}
-        """)
-        
-        if status == "error":
-            self.lbl_meta.setStyleSheet(f"color: {text_th['meta']['color_error']}; font-size: {text_th['meta']['font_size']}px; font-weight: {text_th['meta']['font_weight']}; background: transparent;")
+        if sel and hov:
+            bg = self.BG_SEL_HOVER
+        elif sel:
+            bg = self.BG_SELECTED
+        elif hov:
+            bg = self.BG_HOVER
         else:
-            self.lbl_meta.setStyleSheet(f"color: {text_th['meta']['color']}; font-size: {text_th['meta']['font_size']}px; font-weight: {text_th['meta']['font_weight']}; background: transparent;")
-            
-        self.lbl_meta.setText(detail_text)
+            bg = self.BG_NORMAL
+
+        border = self.BORDER_SELECTED if sel else self.BORDER_NORMAL
+        title_color = self.TITLE_SELECTED if sel else self.TITLE_NORMAL
+
+        self.setStyleSheet(f"""
+            #projectItem {{
+                background-color: {bg};
+                border: {border};
+                border-radius: {self.ITEM_RADIUS}px;
+                margin: {self.ITEM_MARGIN};
+            }}
+        """)
+
+        self.title_label.set_title(self.name, color=title_color)
+
+    # ── Mouse Events ─────────────────────────────────────────────
+
+    def enterEvent(self, event):
+        self._hovered = True
+        self._apply_visual_state()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        self._apply_visual_state()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        """Click self-selects and also notifies the QListWidget."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.set_selected(True)
+        super().mousePressEvent(event)
+
+    # ── Helpers ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _default_detail(status: str) -> str:
+        defaults = {
+            "unknown": "Not Rendered",
+            "queued": "Waiting in queue...",
+            "rendering": "Processing...",
+            "ready": "Completed",
+            "error": "Failed — Check Logs",
+        }
+        return defaults.get(status, "Not Rendered")
+
+    @staticmethod
+    def _badge_label(status: str, pct: int) -> str:
+        if status == "rendering" and pct > 0:
+            return f"{pct}%"
+        return StatusTheme.badge_label(status)
+
+
+# =================================================================
+# SELECTION MANAGER (Decoupled from MainWindow)
+# =================================================================
+
+class ProjectSelectionManager:
+    """
+    Manages selection across all ProjectListItemWidget instances
+    in a QListWidget. Replaces the manual loops in MainWindow.
+
+    Usage:
+        manager = ProjectSelectionManager(list_widget)
+        manager.refresh()          # sync from QListWidget selection
+        manager.select_path(path)  # programmatic selection
+    """
+
+    def __init__(self, list_widget: QListWidget):
+        self._list = list_widget
+        self._state = SelectionState()
+
+    @property
+    def state(self) -> SelectionState:
+        return self._state
+
+    def refresh(self):
+        """Sync selection state from the QListWidget's current selection."""
+        selected_items = self._list.selectedItems()
+        if selected_items:
+            path = selected_items[0].data(Qt.ItemDataRole.UserRole)
+            self._state.select(path)
+        else:
+            self._state.deselect_all()
+        self._update_all_widgets()
+
+    def select_path(self, path: str):
+        """Programmatically select the item with the given path."""
+        self._state.select(path)
+        self._update_all_widgets()
+
+        # Also update the QListWidget's selection model
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) == path:
+                self._list.setCurrentItem(item)
+                break
+
+    def selected_path(self) -> str:
+        return self._state.selected_path
+
+    def _update_all_widgets(self):
+        """Push current selection state to every item widget."""
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            widget = self._list.itemWidget(item)
+            if isinstance(widget, ProjectListItemWidget):
+                widget._apply_visual_state()
 
 
 class QTextEditLogger(logging.Handler):
@@ -303,7 +590,7 @@ class SettingsTabWidget(QWidget):
 
         # Build Pages
         self.page_general = self._create_general_page()
-        self.page_backend_settings = self._create_backend_settings_page() 
+        self.page_backend_settings = self._create_backend_settings_page()
         self.page_hardware = self._create_hardware_page()
         self.page_chunking = self._create_chunking_page()
         self.page_paths = self._create_paths_page()
@@ -315,9 +602,6 @@ class SettingsTabWidget(QWidget):
         self.stack.addWidget(self.page_chunking)
         self.stack.addWidget(self.page_paths)
         self.stack.addWidget(self.page_diagnostics)
-
-        # Connect signal to slot
-        self.log_signal.connect(self._update_test_console_ui)
 
         # Ctrl+S shortcut for settings
         self._save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
@@ -369,8 +653,6 @@ class SettingsTabWidget(QWidget):
         self.enc_combo.setCurrentText(self.config.get('encoder', 'auto'))
         self.worker_spin.setValue(self.config.get('render_workers', 3))
         self.out_dir_edit.setText(self.config.get('output_dir', 'Output'))
-        self.chk_zoom.setChecked(self.config.get('enable_zoom', False))
-        self.spin_zoom.setValue(self.config.get('zoom_factor', 1.1))
         self.trans_spin.setValue(self.config.get('transition_duration', 0.5))
 
         # Backend Settings
@@ -397,15 +679,6 @@ class SettingsTabWidget(QWidget):
     def _create_general_page(self):
         page = QWidget()
         layout = QFormLayout(page)
-
-        profile_group = QGroupBox("Quick Profiles")
-        p_layout = QHBoxLayout()
-        self.profile_combo = QComboBox()
-        self.profile_combo.addItems(["Custom", "Fast Draft (CPU)", "High Quality (GPU)"])
-        self.profile_combo.currentIndexChanged.connect(self.apply_profile)
-        p_layout.addWidget(self.profile_combo)
-        profile_group.setLayout(p_layout)
-        layout.addRow(profile_group)
 
         res_layout = QHBoxLayout()
         self.width_spin = QSpinBox()
@@ -475,24 +748,6 @@ class SettingsTabWidget(QWidget):
         layout.addRow("Max Zoom:", self.spin_zoom)
         return page
 
-    def apply_profile(self, index):
-        if index == 0: return
-        if index == 1: # Draft
-            self.config.set('qwen3_size', '0.6B')
-            self.config.set('qwen3_device_map', 'cpu')
-            self.config.set('fps', 15)
-            self.config.set('enable_zoom', False)
-        elif index == 2: # Cinema
-            self.config.set('qwen3_size', '1.7B')
-            self.config.set('qwen3_device_map', 'cuda:0')
-            self.config.set('qwen3_attn_implementation', 'flash_attention_2')
-            self.config.set('fps', 30)
-            self.config.set('enable_zoom', True)
-            self.config.set('zoom_factor', 1.1)
-        self.profile_combo.setCurrentIndex(0)
-        self.refresh_ui_values()
-        QMessageBox.information(self, "Profile Applied", "Settings updated. Please review Backend tabs.")
-
     # ==========================================================
     # PAGE: BACKEND SETTINGS
     # ==========================================================
@@ -552,33 +807,10 @@ class SettingsTabWidget(QWidget):
         # Group: Diagnostics & Testing
         diag_group = QGroupBox("Diagnostics & Testing")
         diag_layout = QVBoxLayout()
-        
-        # Console Output
-        self.test_console = QPlainTextEdit()
-        self.test_console.setReadOnly(True)
-        self.test_console.setPlaceholderText("Test output will appear here...")
-        self.test_console.setMaximumHeight(100)
-        
-        # Quick Voice Test
-        voice_test_layout = QHBoxLayout()
-        self.test_preview_text = QLineEdit()
-        self.test_preview_text.setPlaceholderText("Enter text for quick audio test...")
-        self.test_preview_text.setText("Hello world, this is a test.")
-        
-        btn_test_voice = QPushButton("Test Audio")
-        btn_test_voice.setToolTip("Generate and play a short audio clip")
-        btn_test_voice.clicked.connect(self.on_test_voice)
-        
-        voice_test_layout.addWidget(QLabel("Input:"))
-        voice_test_layout.addWidget(self.test_preview_text, 1)
-        voice_test_layout.addWidget(btn_test_voice)
-        
-        diag_layout.addWidget(QLabel("<b>Test Console:</b>"))
-        diag_layout.addWidget(self.test_console)
-        diag_layout.addLayout(voice_test_layout)
+        diag_layout.addWidget(QLabel("Run backend diagnostics from the Diagnostics sidebar page."))
         diag_group.setLayout(diag_layout)
-        
         self.scroll_layout.addWidget(diag_group)
+
         self.scroll_layout.addStretch()
         
         scroll.setWidget(scroll_content)
@@ -655,76 +887,6 @@ class SettingsTabWidget(QWidget):
         except Exception as e:
             self.backend_params_layout.addWidget(QLabel(f"<span style='color:red'>Error loading UI: {e}</span>"))
             logger.error(f"Error loading backend settings: {e}")
-
-    def _update_test_console_ui(self, message):
-        self.test_console.appendPlainText(message)
-        sb = self.test_console.verticalScrollBar()
-        sb.setValue(sb.maximum())
-
-    def log_test(self, message):
-        self.log_signal.emit(f">> {message}")
-
-    def on_test_voice(self):
-        btn = self.sender()
-        btn.setEnabled(False)
-        original_text = btn.text()
-        btn.setText("Running...")
-        self.log_test("Starting Audio Test...")
-        
-        def _run():
-            tmp_path = ""
-            backend = None
-            try:
-                text = self.test_preview_text.text().strip()
-                if not text:
-                    self.log_test("ERROR: No text to generate.")
-                    return
-
-                import tempfile
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                    tmp_path = tmp.name
-                
-                backend_name = self.config.get('active_backend', 'qwen3')
-                self.log_test(f"Initializing backend: {backend_name}...")
-                
-                backend = backends.get_backend(backend_name, self.config.settings)
-                self.log_test(f"Generating audio for: '{text}'")
-                
-                success, errors = backend.generate_batch([text], [tmp_path])
-                
-                if success and os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
-                    self.log_test("SUCCESS: Audio generated.")
-                    try:
-                        if platform.system() == "Windows": os.startfile(tmp_path)
-                        elif platform.system() == "Darwin": subprocess.call(["open", tmp_path])
-                        else: subprocess.call(["xdg-open", tmp_path])
-                    except Exception as e:
-                        self.log_test(f"Could not auto-play file: {e}")
-                        self.log_test(f"File saved at: {tmp_path}")
-                else:
-                    self.log_test("FAILED: Backend returned failure.")
-                    if errors:
-                        err_msg = str(errors[0]).split('\n')[0]
-                        self.log_test(f"Reason: {err_msg}")
-
-            except Exception as e:
-                import traceback
-                self.log_test(f"CRASH: {str(e)}")
-                logger.error(traceback.format_exc())
-            finally:
-                if backend:
-                    self.log_test("Cleaning up backend...")
-                    try:
-                        backend.cleanup()
-                    except Exception as e:
-                        logger.error(f"Cleanup failed: {e}")
-                
-                QTimer.singleShot(100, lambda: btn.setEnabled(True))
-                QTimer.singleShot(100, lambda: btn.setText(original_text))
-
-        import threading
-        t = threading.Thread(target=_run)
-        t.start()
 
     # ==========================================================
     # PAGE: HARDWARE
@@ -1095,39 +1257,485 @@ class NewProjectTabWidget(QWidget):
             logger.exception("Failed to create project")
             QMessageBox.critical(self, "Error", f"Failed to create project: {e}")
 
+# =================================================================
+# SLIDE LIST PANEL (Modular Sub-Component)
+# =================================================================
+
+class SlideListPanel(QWidget):
+    """Left panel: slide navigation, ordering, and management controls."""
+
+    slide_selected = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        header = QLabel("Slides")
+        header.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+        header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        header.setStyleSheet("color: #ddd; padding: 4px;")
+        layout.addWidget(header)
+
+        self.slide_list = QListWidget()
+        self.slide_list.setStyleSheet("""
+            QListWidget {
+                background-color: #1e1e1e;
+                color: #cccccc;
+                border: 1px solid #333;
+                border-radius: 4px;
+                font-size: 13px;
+                outline: none;
+            }
+            QListWidget::item {
+                padding: 8px 12px;
+                border-bottom: 1px solid #2a2a2a;
+            }
+            QListWidget::item:selected {
+                background-color: #007acc;
+                color: white;
+            }
+            QListWidget::item:hover {
+                background-color: #2a2d2e;
+            }
+        """)
+        self.slide_list.currentRowChanged.connect(self._on_row_changed)
+        layout.addWidget(self.slide_list, stretch=1)
+
+        # Action buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(3)
+
+        self.btn_add = QPushButton("+")
+        self.btn_add.setToolTip("Add blank slide after current")
+        self.btn_remove = QPushButton("−")
+        self.btn_remove.setToolTip("Remove current slide")
+        self.btn_duplicate = QPushButton("⧉")
+        self.btn_duplicate.setToolTip("Duplicate current slide")
+        self.btn_move_up = QPushButton("▲")
+        self.btn_move_up.setToolTip("Move slide up")
+        self.btn_move_down = QPushButton("▼")
+        self.btn_move_down.setToolTip("Move slide down")
+
+        for btn in [self.btn_add, self.btn_remove, self.btn_duplicate,
+                     self.btn_move_up, self.btn_move_down]:
+            btn.setFixedSize(34, 28)
+            btn.setStyleSheet("""
+                QPushButton {
+                    background: #3c3c3c; color: #ddd; border: 1px solid #555;
+                    border-radius: 3px; font-size: 14px; font-weight: bold;
+                }
+                QPushButton:hover { background: #505050; }
+                QPushButton:pressed { background: #007acc; }
+            """)
+            btn_layout.addWidget(btn)
+
+        layout.addLayout(btn_layout)
+
+    def _on_row_changed(self, row):
+        if row >= 0:
+            self.slide_selected.emit(row)
+
+    def load_slides(self, slide_files):
+        self.slide_list.blockSignals(True)
+        self.slide_list.clear()
+        for i, path in enumerate(slide_files):
+            item = QListWidgetItem(f"  Slide {i + 1}")
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            item.setSizeHint(QSize(0, 38))
+            self.slide_list.addItem(item)
+        if slide_files:
+            self.slide_list.setCurrentRow(0)
+        self.slide_list.blockSignals(False)
+
+    def current_index(self):
+        return self.slide_list.currentRow()
+
+    def set_current_index(self, index):
+        if 0 <= index < self.slide_list.count():
+            self.slide_list.setCurrentRow(index)
+
 
 # =================================================================
-# SLIDE EDITOR TAB WIDGET  (with event-based auto-save)
+# SLIDE PREVIEW PANEL (Modular Sub-Component)
+# =================================================================
+
+class SlidePreviewPanel(QWidget):
+    """
+    Center panel: live HTML preview with zoom/scale controls.
+
+    Uses QWebEngineView to render slides with full CSS support
+    (Tailwind, Google Fonts, Material Icons, etc.).
+    Scaling is applied via CSS zoom on the page body.
+    """
+
+    SLIDE_W = 1280
+    SLIDE_H = 720
+    PRESET_SCALES = ["Fit", "25%", "50%", "75%", "100%", "125%", "150%", "200%"]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scale_percent = 100
+        self._fit_mode = False
+        self._base_dir = ""
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # --- Zoom Toolbar ---
+        self._toolbar = QFrame()
+        self._toolbar.setFixedHeight(40)
+        self._toolbar.setObjectName("previewToolbar")
+        self._toolbar.setStyleSheet("""
+            #previewToolbar {
+                background: #252526;
+                border-bottom: 1px solid #3c3c3c;
+            }
+            QPushButton {
+                background: #3c3c3c; color: #ddd; border: 1px solid #555;
+                border-radius: 3px; padding: 3px 10px; font-size: 12px;
+                min-height: 24px;
+            }
+            QPushButton:hover { background: #505050; }
+            QPushButton:pressed { background: #007acc; }
+            QComboBox {
+                background: #3c3c3c; color: #ddd; border: 1px solid #555;
+                border-radius: 3px; padding: 3px 8px; font-size: 12px;
+                min-height: 24px; min-width: 75px;
+            }
+            QComboBox::drop-down { border: none; width: 20px; }
+            QComboBox QAbstractItemView {
+                background: #2d2d2d; color: #ddd;
+                selection-background-color: #007acc; outline: none;
+            }
+            QComboBox QLineEdit {
+                background: #3c3c3c; color: #ddd; border: none;
+            }
+            QLabel { color: #777; font-size: 11px; background: transparent; }
+        """)
+
+        tb = QHBoxLayout(self._toolbar)
+        tb.setContentsMargins(10, 4, 10, 4)
+
+        self.btn_fit = QPushButton("⊞ Fit to Screen")
+        self.btn_fit.setToolTip("Scale slide to fit the preview area")
+        self.btn_fit.clicked.connect(self.fit_to_screen)
+
+        self.btn_zoom_out = QPushButton("−")
+        self.btn_zoom_out.setFixedSize(28, 28)
+        self.btn_zoom_out.setToolTip("Zoom out (−25%)")
+        self.btn_zoom_out.clicked.connect(lambda: self._step_scale(-25))
+
+        self.scale_combo = QComboBox()
+        self.scale_combo.setEditable(True)
+        self.scale_combo.setFixedWidth(85)
+        for s in self.PRESET_SCALES:
+            self.scale_combo.addItem(s)
+        self.scale_combo.setCurrentIndex(4)  # "100%"
+        self.scale_combo.currentTextChanged.connect(self._on_scale_text_changed)
+
+        self.btn_zoom_in = QPushButton("+")
+        self.btn_zoom_in.setFixedSize(28, 28)
+        self.btn_zoom_in.setToolTip("Zoom in (+25%)")
+        self.btn_zoom_in.clicked.connect(lambda: self._step_scale(25))
+
+        self.lbl_info = QLabel(f"{self.SLIDE_W} × {self.SLIDE_H}")
+
+        tb.addWidget(self.btn_fit)
+        tb.addStretch()
+        tb.addWidget(self.btn_zoom_out)
+        tb.addWidget(self.scale_combo)
+        tb.addWidget(self.btn_zoom_in)
+        tb.addStretch()
+        tb.addWidget(self.lbl_info)
+
+        layout.addWidget(self._toolbar)
+
+        # --- Web View ---
+        self.webview = QWebEngineView()
+        self.webview.loadFinished.connect(self._on_load_finished)
+        self.webview.setStyleSheet("background-color: #1a1a1a;")
+
+        layout.addWidget(self.webview, stretch=1)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def load_file(self, html_path: str):
+        """Load an HTML slide file from disk into the preview."""
+        self._base_dir = os.path.dirname(os.path.abspath(html_path))
+        url = QUrl.fromLocalFile(os.path.abspath(html_path))
+        self.webview.load(url)
+
+    def load_html(self, html_content: str, base_dir: str):
+        """Load an HTML string into the preview with a base URL for relative paths."""
+        self._base_dir = base_dir
+        base_url = QUrl.fromLocalFile(os.path.abspath(base_dir) + os.sep)
+        self.webview.setHtml(html_content, base_url)
+
+    def refresh_scale(self):
+        """Re-apply current scale (call after content change or resize)."""
+        if self._fit_mode:
+            QTimer.singleShot(30, self.fit_to_screen)
+        else:
+            self._apply_zoom(self._scale_percent)
+
+    def fit_to_screen(self):
+        """Calculate the scale that fits the slide inside the preview area."""
+        vw = self.webview.width()
+        vh = self.webview.height()
+        if vw <= 0 or vh <= 0:
+            return
+        scale_w = vw / self.SLIDE_W
+        scale_h = vh / self.SLIDE_H
+        factor = min(scale_w, scale_h)
+        percent = max(10, int(factor * 100))
+        self._fit_mode = True
+        self._scale_percent = percent
+        self._apply_zoom(percent)
+        self._update_combo_text("Fit")
+
+    def set_scale(self, percent: int):
+        """Set an exact scale percentage and exit fit mode."""
+        percent = max(10, min(400, percent))
+        self._fit_mode = False
+        self._scale_percent = percent
+        self._apply_zoom(percent)
+        self._update_combo_text(f"{percent}%")
+
+    def current_scale(self) -> int:
+        return self._scale_percent
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _apply_zoom(self, percent: int):
+        """Apply CSS zoom to the page body via JavaScript."""
+        js = f"""
+        (function() {{
+            document.body.style.zoom = '{percent}%';
+            document.body.style.overflow = 'hidden';
+            document.documentElement.style.overflow = 'hidden';
+        }})();
+        """
+        self.webview.page().runJavaScript(js)
+
+    def _step_scale(self, delta: int):
+        new_pct = max(10, min(400, self._scale_percent + delta))
+        self.set_scale(new_pct)
+
+    def _on_scale_text_changed(self, text: str):
+        text = text.strip()
+        if text.lower() == "fit":
+            self.fit_to_screen()
+            return
+        clean = text.replace('%', '').strip()
+        try:
+            val = int(clean)
+            self.set_scale(val)
+        except ValueError:
+            pass
+
+    def _update_combo_text(self, text: str):
+        self.scale_combo.blockSignals(True)
+        self.scale_combo.setCurrentText(text)
+        self.scale_combo.blockSignals(False)
+
+    def _on_load_finished(self, ok):
+        if ok:
+            if self._fit_mode:
+                QTimer.singleShot(80, self.fit_to_screen)
+            else:
+                self._apply_zoom(self._scale_percent)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._fit_mode:
+            self.fit_to_screen()
+
+
+# =================================================================
+# SLIDE EDIT PANEL (Modular Sub-Component)
+# =================================================================
+
+class SlideEditPanel(QWidget):
+    """Right panel: text narration editor and HTML source editor."""
+
+    content_changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._is_loading = False
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet("""
+            QTabWidget::pane {
+                border: 1px solid #333; border-radius: 4px;
+                background: #1e1e1e;
+            }
+            QTabBar::tab {
+                background: #2d2d2d; color: #aaa; padding: 6px 14px;
+                border: 1px solid #333; border-bottom: none;
+                border-top-left-radius: 4px; border-top-right-radius: 4px;
+                margin-right: 2px;
+            }
+            QTabBar::tab:selected {
+                background: #1e1e1e; color: #fff;
+                border-bottom: 2px solid #007acc;
+            }
+            QTabBar::tab:hover { background: #383838; }
+        """)
+
+        # --- Text Tab ---
+        text_widget = QWidget()
+        text_layout = QVBoxLayout(text_widget)
+        text_layout.setContentsMargins(4, 4, 4, 4)
+
+        text_hint = QLabel("Narration text — sent to TTS for audio generation")
+        text_hint.setStyleSheet("color: #888; font-size: 11px; padding: 2px 4px;")
+        text_hint.setWordWrap(True)
+        text_layout.addWidget(text_hint)
+
+        self.text_editor = QTextEdit()
+        self.text_editor.setPlaceholderText(
+            "Enter narration text for TTS...\n\n"
+            "This text will be converted to speech during rendering."
+        )
+        self.text_editor.setStyleSheet("""
+            QTextEdit {
+                background: #1e1e1e; color: #d4d4d4;
+                border: 1px solid #333; border-radius: 4px;
+                font-size: 14px; padding: 8px;
+            }
+        """)
+        self.text_editor.textChanged.connect(self._on_text_changed)
+        text_layout.addWidget(self.text_editor)
+
+        self.tabs.addTab(text_widget, "📝 Text")
+
+        # --- HTML Tab ---
+        html_widget = QWidget()
+        html_layout = QVBoxLayout(html_widget)
+        html_layout.setContentsMargins(4, 4, 4, 4)
+
+        html_hint = QLabel("Slide HTML source — controls visual appearance")
+        html_hint.setStyleSheet("color: #888; font-size: 11px; padding: 2px 4px;")
+        html_hint.setWordWrap(True)
+        html_layout.addWidget(html_hint)
+
+        self.html_editor = QPlainTextEdit()
+        self.html_editor.setPlaceholderText("Edit HTML content...")
+        self.html_editor.setFont(QFont("Consolas", 10))
+        self.html_editor.setStyleSheet("""
+            QPlainTextEdit {
+                background: #1e1e1e; color: #d4d4d4;
+                border: 1px solid #333; border-radius: 4px;
+                font-family: Consolas, monospace;
+                font-size: 12px; padding: 8px;
+            }
+        """)
+        self.html_editor.textChanged.connect(self._on_html_changed)
+        html_layout.addWidget(self.html_editor)
+
+        self.tabs.addTab(html_widget, "💻 HTML")
+
+        layout.addWidget(self.tabs)
+
+    # --- Suppress signals during programmatic content load ---
+
+    def _on_text_changed(self):
+        if not self._is_loading:
+            self.content_changed.emit()
+
+    def _on_html_changed(self):
+        if not self._is_loading:
+            self.content_changed.emit()
+
+    def set_loading(self, loading: bool):
+        self._is_loading = loading
+
+    # --- Getters / Setters ---
+
+    def get_text(self) -> str:
+        return self.text_editor.toPlainText()
+
+    def set_text(self, text: str):
+        self._is_loading = True
+        self.text_editor.setPlainText(text)
+        self._is_loading = False
+
+    def get_html(self) -> str:
+        return self.html_editor.toPlainText()
+
+    def set_html(self, html: str):
+        self._is_loading = True
+        self.html_editor.setPlainText(html)
+        self._is_loading = False
+
+    def clear(self):
+        self._is_loading = True
+        self.text_editor.clear()
+        self.html_editor.clear()
+        self._is_loading = False
+
+
+# =================================================================
+# SLIDE EDITOR TAB WIDGET (Main Orchestrator)
 # =================================================================
 
 class SlideEditorTabWidget(QWidget):
     """
-    Slide editor with debounced auto-save for text and HTML changes.
-    
+    Modular slide editor with live preview.
+
+    Architecture:
+        ┌─────────────┬────────────────────────┬──────────────────┐
+        │ SlideList   │  SlidePreviewPanel     │  SlideEditPanel  │
+        │ Panel       │  (QWebEngineView +     │  (Text + HTML    │
+        │ (left nav)  │   zoom controls)       │   editors)       │
+        └─────────────┴────────────────────────┴──────────────────┘
+
+    Features:
+        - Debounced auto-save (800 ms after last keystroke)
+        - Debounced preview refresh (500 ms after last HTML change)
+        - Fit to Screen button with auto-refit on resize
+        - Scale percentage control (combo + / − buttons)
+        - Full CSS rendering (Tailwind CDN, Google Fonts, Material Icons)
+        - Ctrl+S for immediate save
     """
 
-    # Emitted after a successful save so the main window can react if needed.
-    content_saved = Signal(str)   # project_path
+    content_saved = Signal(str)  # project_path
 
-    AUTO_SAVE_DELAY_MS  = 800     # debounce for disk writes
-    PREVIEW_DELAY_MS    = 400     # debounce for web-preview refresh
+    AUTO_SAVE_DELAY_MS = 800
+    PREVIEW_DELAY_MS = 500
 
     def __init__(self, project_path, config, parent=None):
         super().__init__(parent)
         self.project_path = project_path
         self.project_name = os.path.basename(project_path)
         self.config = config
-        
-        self.vid_width  = int(self.config.get('width', 1280))
-        self.vid_height = int(self.config.get('height', 720))
-        self.slide_files  = []       # list of absolute HTML paths
-        self.current_index = 0
-        
-        # ── Guard flag: suppress saves while we are loading content ──
-        self._is_loading = False
-        self._dirty = False          # True when editors hold unsaved content
 
-        # ── Debounce timers ──────────────────────────────────────────
+        self.vid_width = int(self.config.get('width', 1280))
+        self.vid_height = int(self.config.get('height', 720))
+        self.slide_files = []
+        self.current_index = -1
+        self._dirty = False
+
+        # ── Debounce Timers ──────────────────────────────────────
         self._auto_save_timer = QTimer(self)
         self._auto_save_timer.setSingleShot(True)
         self._auto_save_timer.setInterval(self.AUTO_SAVE_DELAY_MS)
@@ -1138,375 +1746,344 @@ class SlideEditorTabWidget(QWidget):
         self._preview_timer.setInterval(self.PREVIEW_DELAY_MS)
         self._preview_timer.timeout.connect(self._refresh_preview)
 
-        # ================================================================
-        # BUILD UI
-        # ================================================================
-        self.layout = QVBoxLayout(self)
-        self.layout.setContentsMargins(0, 0, 0, 0)
-        self.layout.setSpacing(0)
-        
-        # ── Navigation Bar ───────────────────────────────────────────
-        nav_layout = QHBoxLayout()
-        nav_layout.setContentsMargins(5, 5, 5, 5)
-        
-        self.btn_prev = QPushButton("◀ Previous")
-        self.btn_prev.clicked.connect(self.prev_slide)
-        self.lbl_slide_info = QLabel("Slide 1 / 1")
-        self.lbl_slide_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_slide_info.setStyleSheet("font-weight: bold; font-size: 14px;")
-        self.btn_next = QPushButton("Next Slide ▶")
-        self.btn_next.clicked.connect(self.next_slide)
-        
-        nav_layout.addWidget(self.btn_prev)
-        nav_layout.addWidget(self.lbl_slide_info, 1)
-        nav_layout.addWidget(self.btn_next)
-        self.layout.addLayout(nav_layout)
-        
-        # ── Editor & Preview Splitter ────────────────────────────────
+        self._setup_ui()
+        self._connect_signals()
+        self._load_project()
+
+        # Ctrl+S shortcut
+        self._save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
+        self._save_shortcut.activated.connect(self.save_current_slide)
+
+    # ------------------------------------------------------------------
+    # UI Setup
+    # ------------------------------------------------------------------
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # ── Header Bar ───────────────────────────────────────────
+        header = QFrame()
+        header.setFixedHeight(34)
+        header.setObjectName("editorHeader")
+        header.setStyleSheet("""
+            #editorHeader {
+                background: #252526;
+                border-bottom: 1px solid #3c3c3c;
+            }
+        """)
+        hdr = QHBoxLayout(header)
+        hdr.setContentsMargins(10, 0, 10, 0)
+
+        lbl = QLabel(f"📝 {self.project_name}")
+        lbl.setStyleSheet("color: #ddd; font-weight: bold; font-size: 13px; background: transparent;")
+        hdr.addWidget(lbl)
+        hdr.addStretch()
+
+        self.lbl_dirty = QLabel("✓ Saved")
+        self.lbl_dirty.setStyleSheet("color: #6a9955; font-size: 11px; background: transparent;")
+        hdr.addWidget(self.lbl_dirty)
+
+        layout.addWidget(header)
+
+        # ── Main Splitter ────────────────────────────────────────
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        
-        self.editor_tabs = QTabWidget()
-        
-        self.html_editor = QPlainTextEdit()
-        self.html_editor.setStyleSheet(
-            "font-family: Consolas; font-size: 12px; background-color: #1e1e1e; color: #dcdcaa;")
-        self.editor_tabs.addTab(self.html_editor, "HTML Source")
-        
-        self.txt_editor = QPlainTextEdit()
-        self.txt_editor.setStyleSheet(
-            "font-family: Consolas; font-size: 12px; background-color: #1e1e1e; color: #ce9178;")
-        self.editor_tabs.addTab(self.txt_editor, "Voiceover Text")
-        
-        splitter.addWidget(self.editor_tabs)
-        
-        self.preview_container = QFrame()
-        self.preview_container.setStyleSheet("background-color: #ffffff; border-radius: 4px;")
-        self.preview_container_layout = QVBoxLayout(self.preview_container)
-        self.preview_container_layout.setContentsMargins(0, 0, 0, 0)
-        self.preview_container_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        
-        self.preview = QWebEngineView()
-        self.preview.setStyleSheet("background-color: #ffffff; border: none;")
-        self.preview_container_layout.addWidget(self.preview)
-        
-        splitter.addWidget(self.preview_container)
-        splitter.setSizes([600, 600])
-        self.layout.addWidget(splitter)
-        
-        # ── Action Bar ───────────────────────────────────────────────
-        action_layout = QHBoxLayout()
-        action_layout.setContentsMargins(5, 5, 5, 5)
-        
-        self.btn_add_blank = QPushButton("＋ Blank Slide")
-        self.btn_add_blank.clicked.connect(self.add_blank_slide_quick)
+        splitter.setStyleSheet("""
+            QSplitter::handle { background: #3c3c3c; width: 2px; }
+        """)
 
-        self.btn_add_text = QPushButton("＋ Text Slide")
-        self.btn_add_text.clicked.connect(self.add_text_slide_quick)
+        self.list_panel = SlideListPanel()
+        self.list_panel.setMinimumWidth(130)
+        self.list_panel.setMaximumWidth(260)
 
-        self.btn_delete_slide = QPushButton("✕ Delete Slide")
-        self.btn_delete_slide.setStyleSheet("color: #ff6b6b;")
-        self.btn_delete_slide.clicked.connect(self.delete_current_slide)
+        self.preview_panel = SlidePreviewPanel()
+        self.preview_panel.setMinimumWidth(350)
 
-        self.lbl_save_status = QLabel("")
-        self.lbl_save_status.setStyleSheet("color: #888; font-size: 11px;")
+        self.edit_panel = SlideEditPanel()
+        self.edit_panel.setMinimumWidth(280)
 
-        action_layout.addWidget(self.btn_add_blank)
-        action_layout.addWidget(self.btn_add_text)
-        action_layout.addWidget(self.btn_delete_slide)
-        action_layout.addStretch()
-        action_layout.addWidget(self.lbl_save_status)
-        self.layout.addLayout(action_layout)
+        splitter.addWidget(self.list_panel)
+        splitter.addWidget(self.preview_panel)
+        splitter.addWidget(self.edit_panel)
+        splitter.setSizes([150, 620, 380])
 
-        # ================================================================
-        # SIGNALS
-        # ================================================================
-        self.html_editor.textChanged.connect(self._on_content_changed)
-        self.txt_editor.textChanged.connect(self._on_content_changed)
+        layout.addWidget(splitter, stretch=1)
 
-        # ── Keyboard shortcuts ───────────────────────────────────────
-        self._shortcut_save = QShortcut(QKeySequence("Ctrl+S"), self)
-        self._shortcut_save.activated.connect(self.save_current_slide)
+    def _connect_signals(self):
+        # Slide list
+        self.list_panel.slide_selected.connect(self._on_slide_selected)
+        self.list_panel.btn_add.clicked.connect(self._add_slide)
+        self.list_panel.btn_remove.clicked.connect(self._remove_slide)
+        self.list_panel.btn_duplicate.clicked.connect(self._duplicate_slide)
+        self.list_panel.btn_move_up.clicked.connect(self._move_slide_up)
+        self.list_panel.btn_move_down.clicked.connect(self._move_slide_down)
+        # Editor
+        self.edit_panel.content_changed.connect(self._on_content_changed)
 
-        self._shortcut_prev = QShortcut(QKeySequence("Ctrl+Left"), self)
-        self._shortcut_prev.activated.connect(self.prev_slide)
+    # ------------------------------------------------------------------
+    # Project Loading
+    # ------------------------------------------------------------------
 
-        self._shortcut_next = QShortcut(QKeySequence("Ctrl+Right"), self)
-        self._shortcut_next.activated.connect(self.next_slide)
+    def _load_project(self):
+        """Scan project directory and populate the slide list."""
+        import glob as _glob
+        pattern = os.path.join(self.project_path, "slide*.html")
+        files = sorted(_glob.glob(pattern), key=natural_sort_key)
+        self.slide_files = files
+        self.list_panel.load_slides(files)
+        if files:
+            self._on_slide_selected(0)
 
-        # ================================================================
-        # INITIAL LOAD
-        # ================================================================
-        self._scan_slides()
-        if self.slide_files:
-            self._load_slide(0)
-        else:
-            self.lbl_slide_info.setText("No slides found")
+    # ------------------------------------------------------------------
+    # Slide Selection
+    # ------------------------------------------------------------------
 
-    # ==============================================================
-    # CONTENT-CHANGE HANDLING  (event-based auto-save)
-    # ==============================================================
-
-    def _on_content_changed(self):
-        """
-        Called whenever the HTML *or* voiceover-text editor content changes.
-        Restarts the debounce timers so that:
-          • the preview refreshes after PREVIEW_DELAY_MS of inactivity
-          • the file is auto-saved after AUTO_SAVE_DELAY_MS of inactivity
-        """
-        if self._is_loading:
-            return
-        self._dirty = True
-        self.lbl_save_status.setText("● Unsaved")
-        self.lbl_save_status.setStyleSheet("color: #f1c40f; font-size: 11px;")
-        self._auto_save_timer.start()   # restart debounce window
-        self._preview_timer.start()     # restart preview debounce
-
-    def _on_auto_save_timeout(self):
-        """Fired by the debounce timer — save if there are pending changes."""
-        if self._dirty:
-            self.save_current_slide()
-
-    # ==============================================================
-    # SAVE / LOAD
-    # ==============================================================
-
-    def save_current_slide(self):
-        """
-        Persist the current slide's HTML and voiceover text to disk.
-        Called by:
-          • the auto-save debounce timer
-          • Ctrl+S shortcut
-          • _load_slide() before switching away
-        """
-        if self.current_index < 0 or self.current_index >= len(self.slide_files):
-            return
-
-        html_path = self.slide_files[self.current_index]
-        txt_path  = os.path.splitext(html_path)[0] + ".txt"
-
-        html_content = self.html_editor.toPlainText()
-        txt_content  = self.txt_editor.toPlainText()
-
-        try:
-            with open(html_path, 'w', encoding='utf-8') as f:
-                f.write(html_content)
-            with open(txt_path, 'w', encoding='utf-8') as f:
-                f.write(txt_content)
-
-            self._dirty = False
-            self._auto_save_timer.stop()
-
-            self.lbl_save_status.setText("✔ Saved")
-            self.lbl_save_status.setStyleSheet("color: #2ecc71; font-size: 11px;")
-            # Fade the label after 2 seconds
-            QTimer.singleShot(2000, lambda: self.lbl_save_status.setText(""))
-
-            self.content_saved.emit(self.project_path)
-            logger.debug(f"[Editor] Auto-saved slide {self.current_index + 1}")
-
-        except Exception as e:
-            logger.error(f"[Editor] Failed to save slide: {e}")
-            self.lbl_save_status.setText("✘ Save Failed")
-            self.lbl_save_status.setStyleSheet("color: #ff6b6b; font-size: 11px;")
-
-    def _load_slide(self, index):
-        """
-        Load slide *index* into the editors.  Saves the current slide first
-        if it has unsaved changes.
-        """
+    def _on_slide_selected(self, index):
+        """Load the selected slide into editors and preview."""
         if index < 0 or index >= len(self.slide_files):
             return
 
-        # ── Save current before switching ────────────────────────────
-        if self._dirty and self.slide_files:
+        # Save previous if dirty
+        if self._dirty and self.current_index >= 0 and self.current_index != index:
             self.save_current_slide()
 
-        # ── Suppress change-signals while we populate the editors ────
-        self._is_loading = True
         self.current_index = index
-
         html_path = self.slide_files[index]
-        txt_path  = os.path.splitext(html_path)[0] + ".txt"
+        txt_path = os.path.splitext(html_path)[0] + ".txt"
 
+        # Read text
+        text_content = ""
+        if os.path.exists(txt_path):
+            try:
+                with open(txt_path, 'r', encoding='utf-8') as f:
+                    text_content = f.read()
+            except Exception as e:
+                logger.warning(f"Could not read {txt_path}: {e}")
+
+        # Read HTML
         html_content = ""
-        if os.path.exists(html_path):
+        try:
             with open(html_path, 'r', encoding='utf-8') as f:
                 html_content = f.read()
+        except Exception as e:
+            logger.warning(f"Could not read {html_path}: {e}")
 
-        txt_content = ""
-        if os.path.exists(txt_path):
-            with open(txt_path, 'r', encoding='utf-8') as f:
-                txt_content = f.read()
+        # Load into editors (signals suppressed)
+        self.edit_panel.set_loading(True)
+        self.edit_panel.set_text(text_content)
+        self.edit_panel.set_html(html_content)
+        self.edit_panel.set_loading(False)
 
-        self.html_editor.setPlainText(html_content)
-        self.txt_editor.setPlainText(txt_content)
+        # Load into preview from file (ensures CDN resources load correctly)
+        self.preview_panel.load_file(html_path)
 
-        self.lbl_slide_info.setText(
-            f"Slide {index + 1} / {len(self.slide_files)}")
-
-        self._is_loading = False
         self._dirty = False
-        self.lbl_save_status.setText("")
+        self._update_dirty_indicator()
 
-        # ── Refresh the web preview immediately ──────────────────────
-        self._refresh_preview()
+    # ------------------------------------------------------------------
+    # Content Change & Auto-Save
+    # ------------------------------------------------------------------
 
-    def _refresh_preview(self):
-        """
-        Reload the web-engine preview using the *current* editor content
-        (not necessarily saved to disk yet).  A base URL pointing at the
-        project directory ensures relative paths resolve correctly.
-        """
+    def _on_content_changed(self):
+        """Fired when text or HTML editor content changes."""
+        self._dirty = True
+        self._update_dirty_indicator()
+        self._auto_save_timer.start()   # restart debounce
+        self._preview_timer.start()     # restart preview debounce
+
+    def _update_dirty_indicator(self):
+        if self._dirty:
+            self.lbl_dirty.setText("● Unsaved")
+            self.lbl_dirty.setStyleSheet("color: #f1c40f; font-size: 11px; background: transparent;")
+        else:
+            self.lbl_dirty.setText("✓ Saved")
+            self.lbl_dirty.setStyleSheet("color: #6a9955; font-size: 11px; background: transparent;")
+
+    def _on_auto_save_timeout(self):
+        if self._dirty:
+            self.save_current_slide()
+
+    def save_current_slide(self):
+        """Save the current slide's text and HTML to disk."""
         if self.current_index < 0 or self.current_index >= len(self.slide_files):
             return
 
-        html_content = self.html_editor.toPlainText()
-        base_url = QUrl.fromLocalFile(
-            os.path.abspath(self.project_path) + os.sep)
-        self.preview.setHtml(html_content, base_url)
-
-    # ==============================================================
-    # SLIDE SCANNING
-    # ==============================================================
-
-    def _scan_slides(self):
-        """Discover all slide HTML files in the project directory."""
-        import glob
-        from utils import natural_sort_key
-        pattern = os.path.join(self.project_path, "slide*.html")
-        self.slide_files = sorted(glob.glob(pattern), key=natural_sort_key)
-
-    def _next_slide_number(self):
-        """Return the next available slide number (for new slides)."""
-        if not self.slide_files:
-            return 1
-        max_num = 0
-        for p in self.slide_files:
-            m = re.search(r"slide(\d+)\.html", os.path.basename(p))
-            if m:
-                max_num = max(max_num, int(m.group(1)))
-        return max_num + 1
-
-    # ==============================================================
-    # NAVIGATION
-    # ==============================================================
-
-    def prev_slide(self):
-        if self.current_index > 0:
-            self._load_slide(self.current_index - 1)
-
-    def next_slide(self):
-        if self.current_index < len(self.slide_files) - 1:
-            self._load_slide(self.current_index + 1)
-
-    # ==============================================================
-    # SLIDE MANAGEMENT
-    # ==============================================================
-
-    def add_blank_slide_quick(self):
-        """Append a new blank slide and navigate to it."""
-        num = self._next_slide_number()
-        html_path = os.path.join(self.project_path, f"slide{num}.html")
-        txt_path  = os.path.join(self.project_path, f"slide{num}.txt")
-
-        if os.path.exists(html_path):
-            QMessageBox.warning(self, "Exists",
-                                f"Slide file already exists: {html_path}")
-            return
-
-        create_slide_file(html_path, get_blank_slide_html("#000000"))
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write("")
-
-        self._scan_slides()
-        new_index = self.slide_files.index(html_path) if html_path in self.slide_files else len(self.slide_files) - 1
-        self._load_slide(new_index)
-        logger.info(f"[Editor] Added blank slide {num}")
-
-    def add_text_slide_quick(self):
-        """Append a new text slide with a placeholder and navigate to it."""
-        num = self._next_slide_number()
-        html_path = os.path.join(self.project_path, f"slide{num}.html")
-        txt_path  = os.path.join(self.project_path, f"slide{num}.txt")
-
-        if os.path.exists(html_path):
-            QMessageBox.warning(self, "Exists",
-                                f"Slide file already exists: {html_path}")
-            return
-
-        placeholder_text = "Enter voiceover text here."
-        create_slide_file(html_path, get_default_slide_html(placeholder_text))
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write(placeholder_text)
-
-        self._scan_slides()
-        new_index = self.slide_files.index(html_path) if html_path in self.slide_files else len(self.slide_files) - 1
-        self._load_slide(new_index)
-        logger.info(f"[Editor] Added text slide {num}")
-
-    def delete_current_slide(self):
-        """Delete the current slide after confirmation."""
-        if not self.slide_files:
-            return
-
-        if len(self.slide_files) == 1:
-            QMessageBox.warning(
-                self, "Cannot Delete",
-                "Cannot delete the only slide in the project.")
-            return
-
         html_path = self.slide_files[self.current_index]
-        txt_path  = os.path.splitext(html_path)[0] + ".txt"
-        slide_name = os.path.basename(html_path)
-
-        reply = QMessageBox.question(
-            self, "Delete Slide",
-            f"Delete {slide_name}?\nThis cannot be undone.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No)
-
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
-        # Stop timers so we don't try to save a slide we're deleting
-        self._auto_save_timer.stop()
-        self._preview_timer.stop()
-        self._dirty = False
+        txt_path = os.path.splitext(html_path)[0] + ".txt"
 
         try:
-            if os.path.exists(html_path):
-                os.remove(html_path)
-            if os.path.exists(txt_path):
-                os.remove(txt_path)
+            with open(txt_path, 'w', encoding='utf-8') as f:
+                f.write(self.edit_panel.get_text())
         except Exception as e:
-            logger.error(f"Failed to delete slide: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to delete: {e}")
+            logger.error(f"Failed to save text: {e}")
+
+        try:
+            with open(html_path, 'w', encoding='utf-8') as f:
+                f.write(self.edit_panel.get_html())
+        except Exception as e:
+            logger.error(f"Failed to save HTML: {e}")
+
+        self._dirty = False
+        self._update_dirty_indicator()
+        self.content_saved.emit(self.project_path)
+
+    # ------------------------------------------------------------------
+    # Preview Refresh
+    # ------------------------------------------------------------------
+
+    def _refresh_preview(self):
+        """Reload preview with the current HTML editor content (live preview)."""
+        if self.current_index < 0:
             return
+        html = self.edit_panel.get_html()
+        if html.strip():
+            self.preview_panel.load_html(html, self.project_path)
 
-        # Remember where we were
-        old_index = self.current_index
-        self._scan_slides()
-
-        # Navigate: prefer same index, or last slide
-        new_index = min(old_index, len(self.slide_files) - 1)
-        self._load_slide(new_index)
-        logger.info(f"[Editor] Deleted {slide_name}")
-
-    # ==============================================================
-    # CLEANUP  (call before closing the tab)
-    # ==============================================================
+    # ------------------------------------------------------------------
+    # Cleanup (called before tab close)
+    # ------------------------------------------------------------------
 
     def save_and_cleanup(self):
-        """
-        Flush any pending auto-save and stop timers.
-        The MainWindow should call this before removing the tab.
-        """
+        """Flush pending timers and save before tab removal."""
         self._auto_save_timer.stop()
         self._preview_timer.stop()
         if self._dirty:
             self.save_current_slide()
 
-    # ── Keyboard shortcut context ────────────────────────────────────
-    # Ensure our shortcuts only fire when this widget's tab is active.
-    def event(self, event):
-        return super().event(event)
+    # ------------------------------------------------------------------
+    # Slide Management
+    # ------------------------------------------------------------------
+
+    def _add_slide(self):
+        next_num = len(self.slide_files) + 1
+
+        # Find the first unused number to avoid collisions
+        existing = set()
+        for f in self.slide_files:
+            m = re.search(r"slide(\d+)\.html", os.path.basename(f))
+            if m:
+                existing.add(int(m.group(1)))
+        for n in range(1, next_num + 1):
+            if n not in existing:
+                next_num = n
+                break
+
+        html_path = os.path.join(self.project_path, f"slide{next_num}.html")
+        txt_path = os.path.join(self.project_path, f"slide{next_num}.txt")
+
+        try:
+            create_slide_file(html_path, get_blank_slide_html("#1a1a2e"))
+            with open(txt_path, 'w', encoding='utf-8') as f:
+                f.write("")
+            self._load_project()
+            if html_path in self.slide_files:
+                self.list_panel.set_current_index(self.slide_files.index(html_path))
+        except Exception as e:
+            logger.error(f"Failed to add slide: {e}")
+
+    def _remove_slide(self):
+        if len(self.slide_files) <= 1:
+            QMessageBox.information(self, "Cannot Remove",
+                                    "Project must have at least one slide.")
+            return
+
+        idx = self.list_panel.current_index()
+        if idx < 0:
+            return
+
+        reply = QMessageBox.question(
+            self, "Remove Slide",
+            f"Remove Slide {idx + 1}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        html_path = self.slide_files[idx]
+        txt_path = os.path.splitext(html_path)[0] + ".txt"
+        wav_path = os.path.splitext(html_path)[0] + ".wav"
+
+        try:
+            for p in [html_path, txt_path, wav_path]:
+                if os.path.exists(p):
+                    os.remove(p)
+            self._load_project()
+        except Exception as e:
+            logger.error(f"Failed to remove slide: {e}")
+
+    def _duplicate_slide(self):
+        idx = self.list_panel.current_index()
+        if idx < 0:
+            return
+
+        src_html = self.slide_files[idx]
+        src_txt = os.path.splitext(src_html)[0] + ".txt"
+
+        # Find next available number
+        next_num = len(self.slide_files) + 1
+        existing = set()
+        for f in self.slide_files:
+            m = re.search(r"slide(\d+)\.html", os.path.basename(f))
+            if m:
+                existing.add(int(m.group(1)))
+        for n in range(1, next_num + 1):
+            if n not in existing:
+                next_num = n
+                break
+
+        dst_html = os.path.join(self.project_path, f"slide{next_num}.html")
+        dst_txt = os.path.join(self.project_path, f"slide{next_num}.txt")
+
+        try:
+            shutil.copy(src_html, dst_html)
+            if os.path.exists(src_txt):
+                shutil.copy(src_txt, dst_txt)
+            else:
+                with open(dst_txt, 'w', encoding='utf-8') as f:
+                    f.write("")
+            self._load_project()
+            if dst_html in self.slide_files:
+                self.list_panel.set_current_index(self.slide_files.index(dst_html))
+        except Exception as e:
+            logger.error(f"Failed to duplicate slide: {e}")
+
+    def _move_slide_up(self):
+        idx = self.list_panel.current_index()
+        if idx <= 0:
+            return
+        self._swap_slide_content(idx, idx - 1)
+
+    def _move_slide_down(self):
+        idx = self.list_panel.current_index()
+        if idx < 0 or idx >= len(self.slide_files) - 1:
+            return
+        self._swap_slide_content(idx, idx + 1)
+
+    def _swap_slide_content(self, a, b):
+        """Swap the file contents of two slides (preserves filename order)."""
+        ha = self.slide_files[a]
+        hb = self.slide_files[b]
+        ta = os.path.splitext(ha)[0] + ".txt"
+        tb = os.path.splitext(hb)[0] + ".txt"
+
+        try:
+            # Swap HTML
+            with open(ha, 'r', encoding='utf-8') as f: ca = f.read()
+            with open(hb, 'r', encoding='utf-8') as f: cb = f.read()
+            with open(ha, 'w', encoding='utf-8') as f: f.write(cb)
+            with open(hb, 'w', encoding='utf-8') as f: f.write(ca)
+
+            # Swap text
+            tca, tcb = "", ""
+            if os.path.exists(ta):
+                with open(ta, 'r', encoding='utf-8') as f: tca = f.read()
+            if os.path.exists(tb):
+                with open(tb, 'r', encoding='utf-8') as f: tcb = f.read()
+            with open(ta, 'w', encoding='utf-8') as f: f.write(tcb)
+            with open(tb, 'w', encoding='utf-8') as f: f.write(tca)
+
+            self._load_project()
+            self.list_panel.set_current_index(b)
+        except Exception as e:
+            logger.error(f"Failed to swap slides: {e}")

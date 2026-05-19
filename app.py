@@ -49,7 +49,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QShortcut, QKeySequence  
 
 # Local imports
-from dialogs import QTextEditLogger, SlideEditorTabWidget, ProjectListItemWidget, NewProjectTabWidget, SettingsTabWidget
+from dialogs import QTextEditLogger, SlideEditorTabWidget, ProjectListItemWidget, ProjectSelectionManager, NewProjectTabWidget, SettingsTabWidget
 from engines import render_project_worker
 from utils import (logger, detect_ffmpeg, get_project_dirs, 
                    get_library_manifest_path, load_project_manifest, 
@@ -74,7 +74,7 @@ class MainWindow(QMainWindow):
         
         self.init_ui()
         setup_logging(self.log_text)
-        self._cleanup_stale_files()
+        self._cleanup_stale_temp()
         
         self.queue_timer = QTimer()
         self.queue_timer.timeout.connect(self.process_queue)
@@ -136,10 +136,10 @@ class MainWindow(QMainWindow):
 
         self.project_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.project_list.customContextMenuRequested.connect(self.show_library_context_menu)
-        self.project_list.itemSelectionChanged.connect(self.on_library_selection_changed)
+        self.selection_mgr = ProjectSelectionManager(self.project_list)
+        self.project_list.itemSelectionChanged.connect(self.selection_mgr.refresh)
 
         self.project_list.setStyleSheet(list_widget_stylesheet_from_theme())
-
         left_layout.addWidget(self.project_list)
         
         lib_btn_layout = QHBoxLayout()
@@ -261,28 +261,19 @@ class MainWindow(QMainWindow):
         widget = self.tabs.widget(index)
         
         if isinstance(widget, SettingsTabWidget):
+            widget._flush_pending_settings()
             return  # Don't close settings
 
         # Flush any pending auto-save before removing the editor tab
         if isinstance(widget, SlideEditorTabWidget):
             widget.save_and_cleanup()
-        
-        # Flush any pending debounced settings
-        if isinstance(widget, SettingsTabWidget):
-            widget._flush_pending_settings()
 
         self.tabs.removeTab(index)
 
     # --- LIBRARY & PROJECT MANAGEMENT ---
 
     def on_library_selection_changed(self):
-        """Updates the visual borders when selection changes."""
-        for i in range(self.project_list.count()):
-            item = self.project_list.item(i)
-            widget = self.project_list.itemWidget(item)
-            if widget:
-                is_sel = item.isSelected()
-                widget.set_selected_visual(is_sel)
+        self.selection_mgr.refresh()
             
     def on_theme_changed(self, theme_name: str):
         try:
@@ -314,7 +305,7 @@ class MainWindow(QMainWindow):
             project_data.sort(key=lambda x: x["last_rendered"], reverse=True)
 
         for pd in project_data:
-            list_widget = ProjectListItemWidget(pd["name"], pd["path"])
+            list_widget = ProjectListItemWidget(pd["name"], pd["path"],self.selection_mgr.state)
             list_widget.update_status(pd["status"], 0, pd["detail"])
             
             item = QListWidgetItem()
@@ -324,16 +315,8 @@ class MainWindow(QMainWindow):
             self.project_list.addItem(item)
             self.project_list.setItemWidget(item, list_widget)
             
-            if pd["path"] == current_selection:
-                item.setSelected(True)
-            else:
-                list_widget.set_selected_visual(False)
-
-        for i in range(self.project_list.count()):
-            item = self.project_list.item(i)
-            widget = self.project_list.itemWidget(item)
-            if widget:
-                widget.set_selected_visual(item.isSelected())
+        if current_selection:
+            self.selection_mgr.select_path(current_selection)
 
         self.update_stats()
 
@@ -703,10 +686,7 @@ class MainWindow(QMainWindow):
                 del self.active_processes[pid]
                 self.update_stats()
                 
-                if self.scheduler_timer.isActive():
-                    self.schedule_jobs()
-                else:
-                    self.schedule_jobs()
+                self.schedule_jobs()
 
     def handle_message(self, msg):
         if not isinstance(msg, tuple): return
@@ -788,19 +768,16 @@ class MainWindow(QMainWindow):
                 if widget:
                     pct = 0
                     detail = progress_text if progress_text else "Updating..."
-                    
-                    if status == "rendering":
-                        if "%" in progress_text:
-                            try:
-                                pct = int(progress_text.split("(")[-1].replace("%",""))
-                                detail = "Rendering..." 
-                            except: 
-                                detail = "Processing..."
+                    if status == "rendering" and "%" in progress_text:
+                        try:
+                            pct = int(progress_text.split("(")[-1].replace("%", ""))
+                            detail = "Rendering..."
+                        except:
+                            detail = "Processing..."
                     elif status == "ready":
                         detail = "Completed"
                     elif status == "error":
-                        detail = "Failed"
-
+                        detail = "Failed — Check Logs"
                     widget.update_status(status, pct, detail)
                 break
 
@@ -809,33 +786,32 @@ class MainWindow(QMainWindow):
         self.lbl_queue_count.setText(f"Queue: {len(self.pending_projects)}")
 
     def closeEvent(self, event):
-        """Handle application close: ensure all workers are stopped."""
-        if self.active_processes or self.pending_projects:
+        # Flush settings on all open Settings tabs
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, SettingsTabWidget):
+                w._flush_pending_settings()
+                break
+
+        if self.active_processes:
             reply = QMessageBox.question(
-                self, 
-                "Confirm Exit",
-                "Renders are still in progress. Stop and exit?",
+                self,
+                "Active Renders",
+                "Renders are still running. Stop and exit?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No
             )
             if reply == QMessageBox.StandardButton.No:
                 event.ignore()
                 return
-
-            logger.info("Stopping all workers for application exit...")
             self.stop_all_renders()
-            
-            QTimer.singleShot(500, lambda: event.accept())
-        else:
-            event.accept()
+            # Give processes 2 seconds to terminate gracefully
+            for pid, proc_data in list(self.active_processes.items()):
+                proc_data['proc'].join(timeout=2.0)
+
+        event.accept()
 
 if __name__ == "__main__":
-    # PySide6 supports AA_EnableHighDpiScaling directly
-    if hasattr(Qt.ApplicationAttribute, 'AA_EnableHighDpiScaling'):
-        QApplication.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling, True)
-    if hasattr(Qt.ApplicationAttribute, 'AA_UseHighDpiPixmaps'):
-        QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
-
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()

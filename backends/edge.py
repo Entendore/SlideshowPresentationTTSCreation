@@ -14,6 +14,7 @@ FEATURES:
 
 import os
 import gc
+import shutil
 import logging
 import asyncio
 import wave
@@ -334,7 +335,11 @@ class EdgeTTSBackend(BaseTTSBackend):
         rate_slider = QSlider(Qt.Orientation.Horizontal)
         rate_slider.setMinimum(-100)
         rate_slider.setMaximum(100)
-        rate_slider.setValue(int(config.get("edge_rate", "0").replace("%", "")) if isinstance(config.get("edge_rate", "0%"), str) else 0)
+        rate_slider.setValue(
+            EdgeTTSBackend._parse_slider_value(
+                config.get("edge_rate", "+0%"), prefix_chars="+", suffix_chars="%"
+            )
+        )
         rate_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         rate_slider.setTickInterval(25)
         
@@ -345,7 +350,7 @@ class EdgeTTSBackend(BaseTTSBackend):
             rate_label.setText(f"{value}%")
 
         def on_rate_released():
-            config.set("edge_rate", f"{rate_slider.value()}%")
+            config.set("edge_rate", f"{rate_slider.value():+d}%")
         
         rate_slider.valueChanged.connect(on_rate_changed)
         rate_slider.sliderReleased.connect(on_rate_released)
@@ -358,7 +363,11 @@ class EdgeTTSBackend(BaseTTSBackend):
         pitch_slider = QSlider(Qt.Orientation.Horizontal)
         pitch_slider.setMinimum(-50)
         pitch_slider.setMaximum(50)
-        pitch_slider.setValue(int(config.get("edge_pitch", "+0Hz").replace("+", "").replace("Hz", "")) if isinstance(config.get("edge_pitch", "+0Hz"), str) else 0)
+        pitch_slider.setValue(
+            EdgeTTSBackend._parse_slider_value(
+                config.get("edge_pitch", "+0Hz"), prefix_chars="+", suffix_chars="Hz"
+            )
+        )
         pitch_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         pitch_slider.setTickInterval(10)
         
@@ -382,18 +391,13 @@ class EdgeTTSBackend(BaseTTSBackend):
         volume_slider = QSlider(Qt.Orientation.Horizontal)
         volume_slider.setMinimum(-100)
         volume_slider.setMaximum(100)
-        volume_slider.setValue(0)  # Default to 0 (no change)
+        volume_slider.setValue(
+            EdgeTTSBackend._parse_slider_value(
+                config.get("edge_volume", "+0%"), prefix_chars="+", suffix_chars="%"
+            )
+        )
         volume_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         volume_slider.setTickInterval(25)
-        
-        # Parse current volume value
-        current_volume = config.get("edge_volume", "+0%")
-        if isinstance(current_volume, str):
-            vol_str = current_volume.replace("%", "").replace("+", "")
-            try:
-                volume_slider.setValue(int(vol_str))
-            except ValueError:
-                volume_slider.setValue(0)
         
         volume_label = QLabel(f"{volume_slider.value():+d}%")
         volume_label.setMinimumWidth(50)
@@ -415,6 +419,20 @@ class EdgeTTSBackend(BaseTTSBackend):
         
         return widget
 
+    @staticmethod
+    def _parse_slider_value(raw_value: str, prefix_chars: str = "", suffix_chars: str = "%", default: int = 0) -> int:
+        """Safely parse a config string like '+50%' or '-25Hz' into an int for a slider."""
+        if not isinstance(raw_value, str):
+            return default
+        try:
+            cleaned = raw_value
+            for ch in prefix_chars:
+                cleaned = cleaned.replace(ch, "")
+            for ch in suffix_chars:
+                cleaned = cleaned.replace(ch, "")
+            return int(cleaned)
+        except (ValueError, TypeError):
+            return default
     # =================================================================
     # INITIALIZATION
     # =================================================================
@@ -458,95 +476,30 @@ class EdgeTTSBackend(BaseTTSBackend):
     # GENERATION INTERFACE
     # =================================================================
 
-    def generate_batch(self, texts: List[str], output_paths: List[str]) -> Tuple[bool, List[str]]:
-        """
-        Generate audio for a batch of texts using Edge TTS.
-        """
-        errors = []
-        success_count = 0
+    def generate_batch(self, texts, output_paths):
+        self._validate_batch_inputs(texts, output_paths)
         
-        # Validate that we have at least some non-empty text
-        valid_texts = [t for t in texts if t and t.strip()]
-        if not valid_texts:
-            raise ValueError("Cannot generate audio: all texts are empty or whitespace only")
-        
-        # Get chunker for long text handling
         enable_chunking = self.config.get("enable_text_chunking", True)
         chunker = self._get_chunker() if enable_chunking else None
-        
-        # Create temp directory for chunks
         temp_dir = self._get_local_temp_dir("chunks_edge")
-        
-        for i, text in enumerate(texts):
-            logger.info(f"[EdgeTTSBackend] Generating slide {i+1}/{len(texts)}...")
-            
-            # Check if text needs chunking
-            needs_chunking = chunker and chunker.needs_chunking(text)
-            
-            if needs_chunking:
-                logger.info(f"[EdgeTTSBackend] Slide {i+1}: Long text detected ({len(text)} chars), chunking...")
-                language = self.config.get("edge_language", "English")
-                chunks = chunker.chunk_text(text, language)
-                logger.info(f"[EdgeTTSBackend] Slide {i+1}: Split into {len(chunks)} chunks")
-                
-                chunk_paths = []
-                chunk_errors = []
-                total_chunks = len(chunks)
-                
-                for chunk_idx, (chunk_text, estimated_duration) in enumerate(chunks):
-                    chunk_path = os.path.join(temp_dir, f"chunk_{i}_{chunk_idx}.mp3")
-                    
-                    # Report progress
-                    self._report_progress(
-                        "chunk",
-                        chunk_idx + 1,
-                        total_chunks,
-                        f"Chunk {chunk_idx + 1}/{total_chunks}"
-                    )
-                    
-                    try:
-                        # Generate audio for this chunk
-                        success = self._generate_single(chunk_text, chunk_path)
-                        if success:
-                            chunk_paths.append(chunk_path)
-                        else:
-                            chunk_errors.append(f"Failed to generate chunk {chunk_idx + 1}")
-                    except Exception as e:
-                        logger.error(f"Failed to generate chunk {chunk_idx + 1}: {e}")
-                        chunk_errors.append(f"Chunk {chunk_idx + 1}: {str(e)}")
-                
-                if len(chunk_paths) == len(chunks):
-                    # All chunks generated, concatenate them
-                    if self._concatenate_audio_files(chunk_paths, output_paths[i]):
-                        success_count += 1
-                        # Cleanup chunk files
-                        for cp in chunk_paths:
-                            try:
-                                os.remove(cp)
-                            except:
-                                pass
-                    else:
-                        errors.append(f"Failed to concatenate chunks for slide {i+1}")
-                else:
-                    errors.extend(chunk_errors)
-                    
-            else:
-                # Single text, generate directly
-                try:
-                    if self._generate_single(text, output_paths[i]):
-                        success_count += 1
-                    else:
-                        errors.append(f"Failed to generate audio for slide {i+1}")
-                except Exception as e:
-                    logger.error(f"Generation failed for slide {i+1}: {e}")
-                    errors.append(str(e))
-        
+        language = self.config.get("edge_language", "English")
+
+        errors = []
+        success_count = 0
+
+        for i, (text, out_path) in enumerate(zip(texts, output_paths)):
+            logger.info(f"[EdgeTTSBackend] Generating slide {i + 1}/{len(texts)}...")
+            success, error = self._generate_single_with_chunking(
+                text, out_path, i, language, chunker,
+                self._generate_single, self._concatenate_audio_files, temp_dir
+            )
+            if success:
+                success_count += 1
+            elif error:
+                errors.append(error)
+
         self._cleanup_chunk_temp()
-        
-        if success_count == len(texts):
-            return True, []
-        else:
-            return False, errors
+        return (True, []) if success_count == len(texts) else (False, errors)
 
     def _generate_single(self, text: str, output_path: str) -> bool:
         """
@@ -572,7 +525,6 @@ class EdgeTTSBackend(BaseTTSBackend):
                 volume = "+0%"
         
         try:
-            # Create communication object
             communicate = edge_tts.Communicate(
                 text=text.strip(),
                 voice=voice,
@@ -580,41 +532,64 @@ class EdgeTTSBackend(BaseTTSBackend):
                 pitch=pitch,
                 volume=volume
             )
-            
-            # Ensure output directory exists
+
             os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
-            
-            # Generate and save audio - handle async properly
-            try:
-                loop = asyncio.get_running_loop()
-                # We're inside an async context, need to run in a new thread
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(
-                        asyncio.run, 
-                        communicate.save(output_path)
-                    )
-                    future.result()
-            except RuntimeError:
-                # No running loop, safe to use asyncio.run
-                asyncio.run(communicate.save(output_path))
-            
-            # Edge TTS outputs MP3, convert to WAV if needed
+            # Edge TTS always outputs MP3 regardless of file extension.
+            # Save to a temporary MP3 file first, then convert to WAV if needed.
+            base_temp = self.config.get('_temp_dir', '')
+            if base_temp and os.path.isdir(base_temp):
+                mp3_temp = os.path.join(base_temp, f"edge_tmp_{id(communicate)}.mp3")
+            else:
+                mp3_temp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False).name
+
+            self._run_async(communicate.save(mp3_temp))
+
             if output_path.endswith('.wav'):
-                pass
+                # Convert MP3 → WAV
+                if self._convert_mp3_to_wav(mp3_temp, output_path):
+                    self._safe_remove(mp3_temp)
+                else:
+                    # Conversion failed; move MP3 as a fallback with correct extension
+                    fallback = output_path.replace('.wav', '.mp3')
+                    shutil.move(mp3_temp, fallback)
+                    logger.warning(f"[EdgeTTSBackend] WAV conversion failed, saved as MP3: {fallback}")
+                    return False
             elif output_path.endswith('.mp3'):
-                wav_path = output_path.replace('.mp3', '.wav')
-                if self._convert_mp3_to_wav(output_path, wav_path):
-                    os.remove(output_path)
-                    os.rename(wav_path, output_path)
-            
-            logger.info(f"[EdgeTTSBackend] Generated: {output_path}")
-            return True
+                shutil.move(mp3_temp, output_path)
+            else:
+                if self._convert_mp3_to_wav(mp3_temp, output_path):
+                    self._safe_remove(mp3_temp)
+                else:
+                    shutil.move(mp3_temp, output_path)
             
         except Exception as e:
             logger.error(f"[EdgeTTSBackend] Generation failed: {e}")
             return False
+        return True
+    
+    @staticmethod
+    def _safe_remove(path: str):
+        """Safely remove a file, ignoring errors if it doesn't exist."""
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
 
+    @staticmethod
+    def _run_async(coro):
+        """
+        Run an async coroutine safely from any context.
+        
+        Since generate_batch is called from within an already-running
+        event loop (via engines.py asyncio.run), we must always run
+        edge-tts coroutines in a separate thread with their own loop.
+        """
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(asyncio.run, coro)
+            return future.result()
+    
     def _convert_mp3_to_wav(self, mp3_path: str, wav_path: str) -> bool:
         try:
             import subprocess
@@ -640,15 +615,6 @@ class EdgeTTSBackend(BaseTTSBackend):
             logger.error("No audio files to concatenate")
             return False
         
-        if len(audio_files) == 1:
-            try:
-                import shutil
-                shutil.copy(audio_files[0], output_path)
-                return True
-            except Exception as e:
-                logger.error(f"Failed to copy single audio file: {e}")
-                return False
-        
         logger.info(f"[EdgeTTSBackend] Concatenating {len(audio_files)} audio chunks...")
         
         try:
@@ -665,7 +631,9 @@ class EdgeTTSBackend(BaseTTSBackend):
             with open(concat_file, 'w') as f:
                 for audio_file in audio_files:
                     abs_path = os.path.abspath(audio_file).replace(os.sep, '/')
-                    f.write(f"file '{abs_path}'\n")
+                    # Escape single quotes for FFmpeg concat demuxer: replace ' with '\''
+                    escaped_path = abs_path.replace("'", "'\\''")
+                    f.write(f"file '{escaped_path}'\n")
             
             ffmpeg_path = self.config.get("ffmpeg_path", "ffmpeg")
             

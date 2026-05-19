@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 from typing import List, Tuple, Optional, Callable
 import os
 import tempfile
+from utils import logger
 
 class BaseTTSBackend(ABC):
     """
@@ -19,6 +20,14 @@ class BaseTTSBackend(ABC):
         self.config = config
         self._progress_callback: Optional[Callable] = None
         self._chunk_temp_dirs: List[str] = []
+
+    def __enter__(self):
+        self.initialize()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.cleanup()
+        return False
 
     def set_progress_callback(self, callback: Optional[Callable[[str, int, int], None]]):
         """
@@ -91,6 +100,24 @@ class BaseTTSBackend(ABC):
         """
         pass
 
+    def _validate_batch_inputs(self, texts: List[str], output_paths: List[str]):
+        """Validate batch inputs before generation. Call at the start of generate_batch."""
+        if len(texts) != len(output_paths):
+            raise ValueError(
+                f"texts and output_paths must have the same length: "
+                f"{len(texts)} != {len(output_paths)}"
+            )
+        
+        valid_texts = [t for t in texts if t and t.strip()]
+        if not valid_texts:
+            raise ValueError("Cannot generate audio: all texts are empty or whitespace only")
+        
+        # Ensure all output directories exist
+        for path in output_paths:
+            dir_name = os.path.dirname(path)
+            if dir_name:
+                os.makedirs(dir_name, exist_ok=True)
+
     @abstractmethod
     def generate_batch(self, texts: List[str], output_paths: List[str]) -> Tuple[bool, List[str]]:
         """
@@ -113,6 +140,68 @@ class BaseTTSBackend(ABC):
             ValueError: If all texts are empty or whitespace-only.
         """
         pass
+
+    def _generate_single_with_chunking(
+        self,
+        text: str,
+        output_path: str,
+        slide_index: int,
+        language: str,
+        chunker: Optional['TextChunker'],
+        generate_single_fn: Callable[[str, str], bool],
+        concatenate_fn: Callable[[List[str], str], bool],
+        temp_dir: str,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Generate audio for one text item, handling chunking if needed.
+        
+        Returns (success, error_message_or_None).
+        """
+        if not text or not text.strip():
+            return False, "Empty text"
+
+        needs_chunking = chunker and chunker.needs_chunking(text)
+
+        if needs_chunking:
+            logger.info(f"[Backend] Slide {slide_index + 1}: Long text ({len(text)} chars), chunking...")
+            chunks = chunker.chunk_text(text, language)
+            total_chunks = len(chunks)
+            logger.info(f"[Backend] Slide {slide_index + 1}: Split into {total_chunks} chunks")
+
+            chunk_paths = []
+            for chunk_idx, (chunk_text, estimated_duration) in enumerate(chunks):
+                chunk_path = os.path.join(temp_dir, f"chunk_{slide_index}_{chunk_idx}.wav")
+                self._report_progress("chunk", chunk_idx + 1, total_chunks,
+                                      f"Chunk {chunk_idx + 1}/{total_chunks}")
+                try:
+                    if generate_single_fn(chunk_text, chunk_path):
+                        chunk_paths.append(chunk_path)
+                    else:
+                        return False, f"Failed to generate chunk {chunk_idx + 1}"
+                except Exception as e:
+                    return False, f"Chunk {chunk_idx + 1}: {e}"
+
+            if len(chunk_paths) == len(chunks):
+                if concatenate_fn(chunk_paths, output_path):
+                    # Cleanup chunk files
+                    for cp in chunk_paths:
+                        try:
+                            os.remove(cp)
+                        except OSError:
+                            pass
+                    return True, None
+                else:
+                    return False, f"Failed to concatenate chunks for slide {slide_index + 1}"
+            else:
+                return False, f"Only {len(chunk_paths)}/{total_chunks} chunks generated"
+        else:
+            try:
+                if generate_single_fn(text, output_path):
+                    return True, None
+                else:
+                    return False, f"Failed to generate audio for slide {slide_index + 1}"
+            except Exception as e:
+                return False, str(e)
 
     @abstractmethod
     def cleanup(self):

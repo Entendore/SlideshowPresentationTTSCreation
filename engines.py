@@ -104,8 +104,7 @@ def _get_audio_settings_hash(config: dict) -> str:
 
 def _get_video_settings_hash(config: dict) -> str:
     keys_to_hash = [
-        "width", "height", "fps", "encoder", "preset",
-        "enable_zoom", "zoom_factor", "transition_duration"
+        "width", "height", "fps", "encoder", "preset", "transition_duration"
     ]
     data = {k: config.get(k) for k in keys_to_hash}
     json_str = json.dumps(data, sort_keys=True)
@@ -134,7 +133,7 @@ def prepare_slide_tasks(html_files: List[str], ctx: RenderContext) -> List[Slide
     prev_audio_hash = manifest.get('audio_settings_hash', "")
     current_audio_hash = _get_audio_settings_hash(ctx.config)
     
-    settings_changed = (current_audio_hash != prev_audio_hash)
+    settings_changed = (prev_audio_hash != "" and current_audio_hash != prev_audio_hash)
 
     if settings_changed:
         logger.info(f"[Smart Cache] Audio settings changed. Audio will be regenerated.")
@@ -358,22 +357,6 @@ def reset_worker_logger():
     root_logger.addHandler(ch)
     root_logger.setLevel(logging.INFO)
 
-def apply_ken_burns(img_array: np.ndarray, zoom_factor: float) -> np.ndarray:
-    """Applies a centered crop and resize to simulate zoom."""
-    if Image is None: return img_array
-    
-    # Clamp zoom factor to prevent math errors
-    zoom_factor = max(1.0, zoom_factor)
-    
-    h, w = img_array.shape[:2]
-    new_h, new_w = int(h / zoom_factor), int(w / zoom_factor)
-    
-    # Safety check for integer rounding issues
-    if new_h >= h or new_w >= w: return img_array
-    
-    start_h, start_w = (h - new_h) // 2, (w - new_w) // 2
-    cropped = img_array[start_h:start_h+new_h, start_w:start_w+new_w]
-    return np.array(Image.fromarray(cropped).resize((w, h), Image.LANCZOS))
 
 def render_project_worker(project_path, msg_queue, config):
     # Apply Cache Settings from config passed from main process
@@ -430,8 +413,6 @@ def render_project_worker(project_path, msg_queue, config):
         final_video = os.path.join(output_dir, project_name + ".mp4")
         transition_duration = config.get('transition_duration', 0.5)
         transition_frames = int(transition_duration * config['fps'])
-        enable_zoom = config.get('enable_zoom', False)
-        zoom_factor = config.get('zoom_factor', 1.1)
         
         w = config['width']
         h = config['height']
@@ -629,24 +610,27 @@ def render_project_worker(project_path, msg_queue, config):
                 if static_frames > 0:
                     for f_idx in range(static_frames):
                         frame_to_write = img_current
-                        if enable_zoom:
-                            progress = f_idx / static_frames
-                            current_zoom = 1.0 + (zoom_factor - 1.0) * progress
-                            frame_to_write = apply_ken_burns(img_current, current_zoom)
                         try:
                             if ffmpeg_proc.stdin:
                                 ffmpeg_proc.stdin.write(frame_to_write.tobytes())
                         except BrokenPipeError:
                             logger.error("[WORKER] FFmpeg pipe broken during static frame write.")
+                            # Log FFmpeg's error output for diagnosis
                             if ffmpeg_proc and ffmpeg_proc.poll() is None:
                                 ffmpeg_proc.terminate()
+                            ffmpeg_log_path = os.path.join(ctx.temp_dir, "ffmpeg_encode.log")
+                            if os.path.exists(ffmpeg_log_path):
+                                try:
+                                    with open(ffmpeg_log_path, "r") as log_f:
+                                        last_lines = log_f.readlines()[-20:]
+                                        logger.error(f"[WORKER] FFmpeg log (last 20 lines):\n{''.join(last_lines)}")
+                                except Exception:
+                                    pass
                             raise RuntimeError("[WORKER] FFmpeg pipe broken during static frame write.")
                     
                 if not is_last and img_next is not None:
                     start_frame = img_current
                     end_frame = img_next
-                    if enable_zoom: start_frame = apply_ken_burns(img_current, zoom_factor)
-
                     try:
                         for t in range(transition_frames):
                             alpha = t / transition_frames
@@ -693,13 +677,12 @@ def render_project_worker(project_path, msg_queue, config):
             
             concat_log = os.path.join(ctx.temp_dir, "ffmpeg_concat.log")
             
-            # FIX: Check return code for concatenation
             cmd_concat = [ctx.ffmpeg_path, "-y", "-f", "concat", "-safe", "0", "-i", listfile, "-c", "copy", audio_full]
-            res_concat = subprocess.run(cmd_concat, stdout=subprocess.DEVNULL, stderr=open(concat_log, "w"))
+            with open(concat_log, "w") as concat_err:
+                res_concat = subprocess.run(cmd_concat, stdout=subprocess.DEVNULL, stderr=concat_err)
             
             if res_concat.returncode != 0:
                 logger.error(f"FFmpeg Audio Concat FAILED (Exit {res_concat.returncode}). Check log: {concat_log}")
-                # DO NOT generate silent audio - raise an error instead
                 raise RuntimeError(f"FFmpeg failed to concatenate audio tracks. Check log: {concat_log}")
             
             mux_log = os.path.join(ctx.temp_dir, "ffmpeg_mux.log")
@@ -708,8 +691,8 @@ def render_project_worker(project_path, msg_queue, config):
                 "-c:v", "copy", "-c:a", "aac", "-ar", "48000", "-ac", "2",
                 "-b:a", "384k", "-movflags", "+faststart", "-shortest", final_video
             ]
-            
-            res_mux = subprocess.run(cmd_mux, stdout=subprocess.DEVNULL, stderr=open(mux_log, "w"))
+            with open(mux_log, "w") as mux_err:
+                res_mux = subprocess.run(cmd_mux, stdout=subprocess.DEVNULL, stderr=mux_err)
             
             if res_mux.returncode != 0:
                 logger.error(f"FFmpeg Muxing FAILED (Exit {res_mux.returncode}). Check log: {mux_log}")

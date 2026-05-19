@@ -197,9 +197,15 @@ class Qwen3Backend(BaseTTSBackend):
     # UI GENERATION FACTORY
     # =================================================================
     @staticmethod
-    def get_settings_widget(mode: str, config, parent=None) -> QWidget:
+    def get_settings_widget(mode: str, config, parent=None, save_callback=None) -> QWidget:
         widget = QWidget(parent)
         layout = QFormLayout(widget)
+
+        def save(key, value):
+            if save_callback:
+                save_callback(key,value)
+            else:
+                config.set(key,value)
         
         # ---------------------------------------------------------
         # MODE 1: Voice Custom
@@ -211,8 +217,8 @@ class Qwen3Backend(BaseTTSBackend):
             speaker_edit = QLineEdit()
             speaker_edit.setText(config.get("qwen3_speaker", "Vivian"))
             speaker_edit.setPlaceholderText("e.g., Vivian, Ryan")
-            # FIX: Save on finish editing
-            speaker_edit.editingFinished.connect(lambda: config.set("qwen3_speaker", speaker_edit.text()))
+
+            speaker_edit.editingFinished.connect(lambda t: save("qwen3_speaker", t))
             layout.addRow("Speaker Name:", speaker_edit)
             
             instruct_edit = QLineEdit()
@@ -418,6 +424,7 @@ class Qwen3Backend(BaseTTSBackend):
 
     def generate_batch(self, texts: List[str], output_paths: List[str]) -> Tuple[bool, List[str]]:
         # Validate that we have at least some non-empty text
+        self._validate_batch_inputs(texts, output_paths)
         valid_texts = [t for t in texts if t and t.strip()]
         if not valid_texts:
             raise ValueError("Cannot generate audio: all texts are empty or whitespace only")
