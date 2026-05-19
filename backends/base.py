@@ -1,6 +1,8 @@
 # backends/base.py
 from abc import ABC, abstractmethod
 from typing import List, Tuple, Optional, Callable
+import os
+import tempfile
 
 class BaseTTSBackend(ABC):
     """
@@ -13,33 +15,66 @@ class BaseTTSBackend(ABC):
     def __init__(self, config: dict):
         """
         Initialize the backend with the application configuration.
-        
-        Args:
-            config (dict): The global configuration dictionary containing settings
-                           like device map, data types, and model paths.
         """
         self.config = config
         self._progress_callback: Optional[Callable] = None
+        self._chunk_temp_dirs: List[str] = []
 
     def set_progress_callback(self, callback: Optional[Callable[[str, int, int], None]]):
         """
         Set a callback function to report generation progress.
-        
-        Args:
-            callback: A function that takes (stage_name, current, total) parameters
-                     Example: callback("chunk", 2, 5) means processing chunk 2 of 5
         """
         self._progress_callback = callback
+
+    def _get_local_temp_dir(self, subdir: str = "chunks") -> str:
+        """
+        Get a local temp directory for intermediate files.
+        
+        Uses the engine's local temp dir (passed via config['_temp_dir']) 
+        instead of the system temp directory. Falls back to system temp
+        if no local temp is configured.
+        """
+        base_temp = self.config.get('_temp_dir', '')
+        if base_temp and os.path.isdir(base_temp):
+            temp_dir = os.path.join(base_temp, subdir)
+            os.makedirs(temp_dir, exist_ok=True)
+        else:
+            # Fallback to system temp (shouldn't happen in normal operation)
+            temp_dir = tempfile.mkdtemp(prefix=f"tts_{subdir}_")
+        
+        self._chunk_temp_dirs.append(temp_dir)
+        return temp_dir
+    
+    def _cleanup_chunk_temp(self):
+        """
+        Clean up all chunk temp directories created during generation.
+        
+        For local temp dirs (inside engine's temp), only removes the 
+        chunk subdirectory contents. The engine's finally block handles 
+        the full cleanup of the base temp dir.
+        """
+        import shutil
+        base_temp = self.config.get('_temp_dir', '')
+        
+        for chunk_dir in self._chunk_temp_dirs:
+            try:
+                if not os.path.exists(chunk_dir):
+                    continue
+                    
+                if base_temp and chunk_dir.startswith(base_temp):
+                    # Local temp: remove chunk subdirectory (safe, won't affect parent)
+                    shutil.rmtree(chunk_dir, ignore_errors=True)
+                else:
+                    # System temp: remove entirely
+                    shutil.rmtree(chunk_dir, ignore_errors=True)
+            except Exception:
+                pass
+        
+        self._chunk_temp_dirs.clear()
 
     def _report_progress(self, stage: str, current: int, total: int, message: str = ""):
         """
         Internal method to report progress if a callback is set.
-        
-        Args:
-            stage: Progress stage name (e.g., "chunk", "slide")
-            current: Current item number
-            total: Total items
-            message: Optional additional message
         """
         if self._progress_callback:
             self._progress_callback(stage, current, total, message)

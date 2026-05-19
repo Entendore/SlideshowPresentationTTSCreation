@@ -385,9 +385,6 @@ class EdgeTTSBackend(BaseTTSBackend):
         volume_slider.setValue(0)  # Default to 0 (no change)
         volume_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         volume_slider.setTickInterval(25)
-
-        def on_volume_released():
-            config.set("edge_volume", f"{volume_slider.value():+d}%")
         
         # Parse current volume value
         current_volume = config.get("edge_volume", "+0%")
@@ -454,6 +451,7 @@ class EdgeTTSBackend(BaseTTSBackend):
         No local resources to clean up for Edge TTS.
         """
         logger.info("[EdgeTTSBackend] Cleanup called (no local resources to free)")
+        self._cleanup_chunk_temp()
         gc.collect()
 
     # =================================================================
@@ -463,16 +461,6 @@ class EdgeTTSBackend(BaseTTSBackend):
     def generate_batch(self, texts: List[str], output_paths: List[str]) -> Tuple[bool, List[str]]:
         """
         Generate audio for a batch of texts using Edge TTS.
-        
-        Args:
-            texts: List of text strings to convert to speech
-            output_paths: List of output file paths for the generated audio
-            
-        Returns:
-            Tuple of (success, error_messages)
-            
-        Raises:
-            ValueError: If all texts are empty (no valid content to generate)
         """
         errors = []
         success_count = 0
@@ -487,7 +475,7 @@ class EdgeTTSBackend(BaseTTSBackend):
         chunker = self._get_chunker() if enable_chunking else None
         
         # Create temp directory for chunks
-        temp_dir = tempfile.mkdtemp(prefix="edge_tts_chunks_")
+        temp_dir = self._get_local_temp_dir("chunks_edge")
         
         for i, text in enumerate(texts):
             logger.info(f"[EdgeTTSBackend] Generating slide {i+1}/{len(texts)}...")
@@ -553,12 +541,7 @@ class EdgeTTSBackend(BaseTTSBackend):
                     logger.error(f"Generation failed for slide {i+1}: {e}")
                     errors.append(str(e))
         
-        # Cleanup temp directory
-        try:
-            import shutil
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except:
-            pass
+        self._cleanup_chunk_temp()
         
         if success_count == len(texts):
             return True, []
@@ -672,11 +655,17 @@ class EdgeTTSBackend(BaseTTSBackend):
             import subprocess
             import tempfile
             
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            base_temp = self.config.get('_temp_dir', '')
+            if base_temp and os.path.isdir(base_temp):
+                concat_file = os.path.join(base_temp, "edge_concat_list.txt")
+            else:
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                    concat_file = f.name
+            
+            with open(concat_file, 'w') as f:
                 for audio_file in audio_files:
                     abs_path = os.path.abspath(audio_file).replace(os.sep, '/')
                     f.write(f"file '{abs_path}'\n")
-                concat_file = f.name
             
             ffmpeg_path = self.config.get("ffmpeg_path", "ffmpeg")
             

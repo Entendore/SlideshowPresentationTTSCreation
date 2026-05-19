@@ -74,6 +74,7 @@ class MainWindow(QMainWindow):
         
         self.init_ui()
         setup_logging(self.log_text)
+        self._cleanup_stale_files()
         
         self.queue_timer = QTimer()
         self.queue_timer.timeout.connect(self.process_queue)
@@ -260,8 +261,16 @@ class MainWindow(QMainWindow):
         widget = self.tabs.widget(index)
         
         if isinstance(widget, SettingsTabWidget):
-            return # Don't close settings
-            
+            return  # Don't close settings
+
+        # Flush any pending auto-save before removing the editor tab
+        if isinstance(widget, SlideEditorTabWidget):
+            widget.save_and_cleanup()
+        
+        # Flush any pending debounced settings
+        if isinstance(widget, SettingsTabWidget):
+            widget._flush_pending_settings()
+
         self.tabs.removeTab(index)
 
     # --- LIBRARY & PROJECT MANAGEMENT ---
@@ -590,11 +599,48 @@ class MainWindow(QMainWindow):
         logger.info(f"Started worker [PID {proc.pid}] for {os.path.basename(project_path)}")
         self.lbl_status.setText(f"Active Jobs: {len(self.active_processes)}")
 
+    def _cleanup_stale_temp(self):
+        """Remove any leftover temp directories from previous crashed runs."""
+        temp_base = os.path.join(os.getcwd(), "temp")
+        if not os.path.isdir(temp_base):
+            return
+        
+        try:
+            entries = os.listdir(temp_base)
+            if entries:
+                logger.info(f"[Startup] Cleaning up {len(entries)} stale temp director(ies) from previous runs")
+                for entry in entries:
+                    entry_path = os.path.join(temp_base, entry)
+                    try:
+                        if os.path.isdir(entry_path):
+                            shutil.rmtree(entry_path, ignore_errors=True)
+                            logger.info(f"[Startup] Removed stale temp: {entry}")
+                    except Exception as e:
+                        logger.warning(f"[Startup] Could not remove stale temp '{entry}': {e}")
+                
+                # Remove the base temp dir if now empty
+                try:
+                    if not os.listdir(temp_base):
+                        os.rmdir(temp_base)
+                except OSError:
+                    pass
+            else:
+                # Empty temp dir, remove it
+                try:
+                    os.rmdir(temp_base)
+                except OSError:
+                    pass
+        except Exception as e:
+            logger.warning(f"[Startup] Error during stale temp cleanup: {e}")
+
     def stop_all_renders(self):
         logger.info("Stopping all renders...")
         self.pending_projects.clear()
         
         for pid, proc_data in list(self.active_processes.items()):
+            project_path = proc_data['path']
+            project_name = os.path.basename(project_path)
+            
             try:
                 proc_data['proc'].terminate()
                 proc_data['proc'].join(timeout=1.0)
@@ -602,6 +648,16 @@ class MainWindow(QMainWindow):
                     proc_data['proc'].kill()
             except Exception as e:
                 logger.error(f"Error stopping process {pid}: {e}")
+            
+            # Force-clean this project's local temp dir since the worker's 
+            # finally block may not execute after kill()
+            temp_dir = os.path.join(os.getcwd(), "temp", project_name)
+            if os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    logger.info(f"Forced cleanup of temp dir for stopped project: {project_name}")
+                except Exception as e:
+                    logger.warning(f"Could not clean temp for {project_name}: {e}")
         
         self.active_processes.clear()
         self.scheduler_timer.stop()

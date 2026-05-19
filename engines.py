@@ -159,7 +159,7 @@ def prepare_slide_tasks(html_files: List[str], ctx: RenderContext) -> List[Slide
         chunker = None
 
     tasks = []
-    long_text_slides = []  # Track slides with long text
+    long_text_slides = []
     
     for html_file in html_files:
         p_html = Path(html_file)
@@ -217,7 +217,7 @@ def prepare_slide_tasks(html_files: List[str], ctx: RenderContext) -> List[Slide
             txt_path=str(p_txt),
             target_audio_path=str(target_audio),
             text_content=text_content,
-            source_audio_path=str(source_audio), # Pass path for caching
+            source_audio_path=str(source_audio),
             needs_tts=needs_tts
         )
         tasks.append(task)
@@ -262,7 +262,6 @@ async def process_audio_tasks(tasks: List[SlideTask], ctx: RenderContext, msg_qu
         backend_name = ctx.config.get("active_backend", "qwen3")
         logger.info(f"[Worker] Initializing Backend: {backend_name}...")
         
-        # Factory load
         backend = get_backend(backend_name, ctx.config)
         
         # Set up progress callback for chunk-level reporting
@@ -270,7 +269,6 @@ async def process_audio_tasks(tasks: List[SlideTask], ctx: RenderContext, msg_qu
             """Forward backend progress to the main process via message queue."""
             project_name = os.path.basename(ctx.project_path)
             if stage == "chunk":
-                # Report chunk progress: ("CHUNK_PROGRESS", project_name, current, total, message)
                 msg_queue.put(("CHUNK_PROGRESS", project_name, current, total, message))
         
         backend.set_progress_callback(progress_callback)
@@ -283,7 +281,6 @@ async def process_audio_tasks(tasks: List[SlideTask], ctx: RenderContext, msg_qu
         success, errors = backend.generate_batch(texts, output_paths)
         
         if success:
-            # Save generated audio to project cache
             for task in tasks_to_generate:
                 try:
                     if task.source_audio_path and os.path.exists(task.target_audio_path):
@@ -294,7 +291,6 @@ async def process_audio_tasks(tasks: List[SlideTask], ctx: RenderContext, msg_qu
             msg_queue.put((os.path.basename(ctx.project_path), total_to_generate, total_to_generate))
         else:
             # Handle partial or full failures - DO NOT generate silent WAV
-            # Instead, raise an error to indicate the problem
             logger.error(f"[Worker] Backend reported errors.")
             msg_queue.put((os.path.basename(ctx.project_path), 0, total_to_generate))
             
@@ -305,7 +301,6 @@ async def process_audio_tasks(tasks: List[SlideTask], ctx: RenderContext, msg_qu
                 task.generation_error = err_msg
                 error_messages.append(f"Slide {task.slide_number}: {err_msg}")
             
-            # Raise an error instead of silently generating empty audio
             raise RuntimeError(f"Audio generation failed: {'; '.join(error_messages)}")
 
     except Exception as e:
@@ -318,7 +313,13 @@ async def process_audio_tasks(tasks: List[SlideTask], ctx: RenderContext, msg_qu
         raise
         
     finally:
-        # CRITICAL: Ensure backend cleanup is called to free VRAM
+        # Clean up backend chunk temp dirs before backend cleanup
+        if backend and hasattr(backend, '_cleanup_chunk_temp'):
+            try:
+                backend._cleanup_chunk_temp()
+            except Exception as e:
+                logger.warning(f"[Worker] Error cleaning backend chunk temp: {e}")
+        
         if backend:
             logger.info("[Worker] Cleaning up backend resources...")
             try:
@@ -397,10 +398,16 @@ def render_project_worker(project_path, msg_queue, config):
     # Create temp folder in current working directory
     cwd = os.getcwd()
     temp_base_dir = os.path.join(cwd, "temp")
+    project_temp_dir = os.path.join(temp_base_dir, project_name)
+
+    # Clean up any stale temp from a previous crashed run
+    if os.path.exists(project_temp_dir):
+        logger.warning(f"[WORKER {project_name}] Removing stale temp dir from previous run: {project_temp_dir}")
+        shutil.rmtree(project_temp_dir, ignore_errors=True)
     
     ctx = RenderContext(
         project_path=project_path,
-        temp_dir=os.path.join(temp_base_dir, project_name),
+        temp_dir=project_temp_dir,
         config=config,
         ffmpeg_path=config.get('ffmpeg_path'),
         render_mode='full'
@@ -413,6 +420,9 @@ def render_project_worker(project_path, msg_queue, config):
         logger.error(f"[WORKER {project_name}] Cannot create temp dir: {e}")
         msg_queue.put(("ERROR", project_name, f"Cannot create temp dir: {e}"))
         return
+
+    # Make temp_dir available to backends so they use LOCAL temp instead of system temp
+    config['_temp_dir'] = ctx.temp_dir
 
     # Async Runner
     async def run_async():
@@ -740,13 +750,23 @@ def render_project_worker(project_path, msg_queue, config):
         logger.exception(f"[WORKER] Async wrapper crash: {e}")
     finally:
         # =================================================================
-        # TEMP CLEANUP
+        # TEMP CLEANUP — ALWAYS runs, even on crash
         # =================================================================
-        # Clean up the specific project temp directory after completion
         try:
             if os.path.exists(ctx.temp_dir):
                 shutil.rmtree(ctx.temp_dir)
-                logger.info(f"[WORKER {project_name}] Cleaned up temp files.")
+                logger.info(f"[WORKER {project_name}] Cleaned up local temp directory: {ctx.temp_dir}")
+            
+            # Remove the base temp/ directory if it's now empty (no other projects running)
+            parent_temp = os.path.dirname(ctx.temp_dir)
+            if os.path.isdir(parent_temp):
+                try:
+                    remaining = os.listdir(parent_temp)
+                    if not remaining:
+                        os.rmdir(parent_temp)
+                        logger.info(f"[WORKER {project_name}] Removed empty parent temp directory: {parent_temp}")
+                except OSError:
+                    pass  # Not empty or permission issue, that's fine
         except Exception as clean_e:
             logger.warning(f"[WORKER {project_name}] Failed to clean temp dir: {clean_e}")
 

@@ -242,7 +242,7 @@ class Qwen3Backend(BaseTTSBackend):
             
             btn_browse = QPushButton("...")
             btn_browse.setMaximumWidth(30)
-            btn_browse.clicked.connect(lambda: Qwen3Backend._browse_audio(ref_audio_edit, ref_text_edit))
+            btn_browse.clicked.connect(lambda: Qwen3Backend._browse_audio(ref_audio_edit, ref_text_edit, config))
             
             ref_row.addWidget(ref_audio_edit)
             ref_row.addWidget(btn_browse)
@@ -407,6 +407,7 @@ class Qwen3Backend(BaseTTSBackend):
             logger.info("[Qwen3Backend] Cleaning up model resources...")
             del self.model
             self.model = None
+        self._cleanup_chunk_temp()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -606,7 +607,7 @@ class Qwen3Backend(BaseTTSBackend):
         success_count = 0
         
         chunker = self._get_chunker() if enable_chunking else None
-        temp_dir = tempfile.mkdtemp(prefix="qwen3_chunks_")
+        temp_dir = self._get_local_temp_dir("chunks_custom")
 
         for i, text in enumerate(texts):
             logger.info(f"[Qwen3Backend] Generating slide {i+1}/{len(texts)}...")
@@ -669,11 +670,7 @@ class Qwen3Backend(BaseTTSBackend):
                     logger.error(f"Voice Custom failed for slide {i+1}: {e}")
                     errors.append(str(e))
         
-        try:
-            import shutil
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except:
-            pass
+        self._cleanup_chunk_temp()
 
         if success_count == len(texts):
             return True, []
@@ -710,7 +707,7 @@ class Qwen3Backend(BaseTTSBackend):
         success_count = 0
         
         chunker = self._get_chunker() if enable_chunking else None
-        temp_dir = tempfile.mkdtemp(prefix="qwen3_chunks_")
+        temp_dir = self._get_local_temp_dir("chunks_clone")
 
         for i, text in enumerate(texts):
             logger.info(f"[Qwen3Backend] Generating slide {i+1}/{len(texts)}...")
@@ -781,11 +778,7 @@ class Qwen3Backend(BaseTTSBackend):
                     logger.error(f"Voice Clone failed for slide {i+1}: {e}")
                     errors.append(str(e))
         
-        try:
-            import shutil
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except:
-            pass
+        self._cleanup_chunk_temp()
 
         if success_count == len(texts):
             return True, []
@@ -811,7 +804,7 @@ class Qwen3Backend(BaseTTSBackend):
         success_count = 0
         
         chunker = self._get_chunker() if enable_chunking else None
-        temp_dir = tempfile.mkdtemp(prefix="qwen3_chunks_")
+        temp_dir = self._get_local_temp_dir("chunks_design")
 
         for i, text in enumerate(texts):
             logger.info(f"[Qwen3Backend] Generating slide {i+1}/{len(texts)}...")
@@ -893,11 +886,7 @@ class Qwen3Backend(BaseTTSBackend):
                     logger.error(f"Voice Design failed for slide {i+1}: {e}")
                     errors.append(str(e))
         
-        try:
-            import shutil
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except:
-            pass
+        self._cleanup_chunk_temp()
 
         if success_count == len(texts):
             return True, []
