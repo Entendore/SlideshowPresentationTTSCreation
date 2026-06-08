@@ -58,6 +58,12 @@ class EdgeTTSBackend(BaseTTSBackend):
     an internet connection.
     """
 
+    DESCRIPTION = "Edge TTS: Free online TTS from Microsoft Edge. High-quality neural voices. Requires internet."
+
+    AUDIO_SETTINGS_KEYS = [
+        "edge_language", "edge_voice", "edge_rate", "edge_pitch", "edge_volume",
+    ]
+
     # Available voice categories organized by language/region
     EDGE_VOICES = {
         # English voices
@@ -264,14 +270,30 @@ class EdgeTTSBackend(BaseTTSBackend):
     # =================================================================
 
     @staticmethod
-    def get_settings_widget(mode: str, config, parent=None) -> QWidget:
+    def get_settings_widget(mode: str, config, parent=None, save_callback=None) -> QWidget:
         """
         Generate the settings widget for Edge TTS configuration.
         
         Note: 'mode' is ignored for Edge TTS as it has a single mode.
+        
+        Args:
+            mode: Ignored for Edge TTS.
+            config: The AppConfig instance.
+            parent: Parent widget.
+            save_callback: Optional debounced save function(key, value).
+                           If provided, settings are written to disk after a
+                           short delay instead of immediately on every change.
         """
         widget = QWidget(parent)
         layout = QFormLayout(widget)
+
+        # Unified save helper: uses debounced callback when available,
+        # falls back to immediate config.set() otherwise.
+        def save(key, value):
+            if save_callback:
+                save_callback(key, value)
+            else:
+                config.set(key, value)
         
         layout.addRow(QLabel("<b>Edge TTS Configuration</b>"))
         layout.addRow(QLabel("<i>Free online TTS using Microsoft Edge neural voices</i>"))
@@ -283,28 +305,32 @@ class EdgeTTSBackend(BaseTTSBackend):
         current_lang = config.get("edge_language", "English")
         if current_lang in EdgeTTSBackend.EDGE_LANGUAGES:
             lang_combo.setCurrentText(current_lang)
-        
+
+        def _populate_voices_for_language(lang, save_default=False):
+            """Populate voice combo for a language. 
+            If save_default=True, persists the selected voice to config."""
+            voice_combo.blockSignals(True)
+            voice_combo.clear()
+            voices = EdgeTTSBackend.EDGE_VOICES.get(lang, [])
+            for voice_id, voice_name in voices:
+                voice_combo.addItem(voice_name, voice_id)
+            if voices:
+                current_voice = config.get("edge_voice", "")
+                found = False
+                for i in range(voice_combo.count()):
+                    if voice_combo.itemData(i) == current_voice:
+                        voice_combo.setCurrentIndex(i)
+                        found = True
+                        break
+                if not found:
+                    voice_combo.setCurrentIndex(0)
+                    if save_default:
+                        save("edge_voice", voices[0][0])
+            voice_combo.blockSignals(False)
+
         def on_language_changed(lang):
-            config.set("edge_language", lang)
-            # Update voice dropdown based on language
-            voice_combo = widget.findChild(QComboBox, "voice_combo")
-            if voice_combo:
-                voice_combo.clear()
-                voices = EdgeTTSBackend.EDGE_VOICES.get(lang, [])
-                for voice_id, voice_name in voices:
-                    voice_combo.addItem(voice_name, voice_id)
-                # Set default voice for this language
-                if voices:
-                    current_voice = config.get("edge_voice", "")
-                    found = False
-                    for i in range(voice_combo.count()):
-                        if voice_combo.itemData(i) == current_voice:
-                            voice_combo.setCurrentIndex(i)
-                            found = True
-                            break
-                    if not found:
-                        voice_combo.setCurrentIndex(0)
-                        config.set("edge_voice", voices[0][0])
+            save("edge_language", lang)
+            _populate_voices_for_language(lang, save_default=True)
         
         lang_combo.currentTextChanged.connect(on_language_changed)
         layout.addRow("Language:", lang_combo)
@@ -312,22 +338,20 @@ class EdgeTTSBackend(BaseTTSBackend):
         # Voice selector (populated based on language)
         voice_combo = QComboBox()
         voice_combo.setObjectName("voice_combo")
-        voices = EdgeTTSBackend.EDGE_VOICES.get(current_lang, [])
-        for voice_id, voice_name in voices:
-            voice_combo.addItem(voice_name, voice_id)
-        
-        current_voice = config.get("edge_voice", "")
-        if current_voice:
-            for i in range(voice_combo.count()):
-                if voice_combo.itemData(i) == current_voice:
-                    voice_combo.setCurrentIndex(i)
-                    break
-        
+        # BUG FIX: Guard against index < 0 which occurs when combo is cleared.
+        # Previously, voice_combo.clear() triggered on_voice_changed(-1),
+        # which saved None to config via config.set("edge_voice", None).
         def on_voice_changed(index):
+            if index < 0:
+                return
             voice_id = voice_combo.itemData(index)
-            config.set("edge_voice", voice_id)
+            if voice_id is not None:
+                save("edge_voice", voice_id)
         
         voice_combo.currentIndexChanged.connect(on_voice_changed)
+        # Populate voices for the current language WITHOUT saving to config
+        # (the language hasn't actually changed during initialization).
+        _populate_voices_for_language(current_lang, save_default=False)
         layout.addRow("Voice:", voice_combo)
         
         # Speech rate slider
@@ -343,17 +367,14 @@ class EdgeTTSBackend(BaseTTSBackend):
         rate_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         rate_slider.setTickInterval(25)
         
-        rate_label = QLabel(f"{rate_slider.value()}%")
+        rate_label = QLabel(f"{rate_slider.value():+d}%")
         rate_label.setMinimumWidth(50)
         
         def on_rate_changed(value):
-            rate_label.setText(f"{value}%")
-
-        def on_rate_released():
-            config.set("edge_rate", f"{rate_slider.value():+d}%")
+            rate_label.setText(f"{value:+d}%")
+            save("edge_rate", f"{value:+d}%")
         
         rate_slider.valueChanged.connect(on_rate_changed)
-        rate_slider.sliderReleased.connect(on_rate_released)
         rate_layout.addWidget(rate_slider)
         rate_layout.addWidget(rate_label)
         layout.addRow("Speech Rate:", rate_layout)
@@ -376,12 +397,9 @@ class EdgeTTSBackend(BaseTTSBackend):
         
         def on_pitch_changed(value):
             pitch_label.setText(f"{value:+d}Hz")
-        
-        def on_pitch_released():
-            config.set("edge_pitch", f"{pitch_slider.value():+d}Hz")
+            save("edge_pitch", f"{value:+d}Hz")
         
         pitch_slider.valueChanged.connect(on_pitch_changed)
-        pitch_slider.sliderReleased.connect(on_pitch_released)
         pitch_layout.addWidget(pitch_slider)
         pitch_layout.addWidget(pitch_label)
         layout.addRow("Pitch:", pitch_layout)
@@ -404,21 +422,15 @@ class EdgeTTSBackend(BaseTTSBackend):
         
         def on_volume_changed(value):
             volume_label.setText(f"{value:+d}%")
-
-        def on_volume_released():
-            config.set("edge_volume", f"{volume_slider.value():+d}%")
+            save("edge_volume", f"{value:+d}%")
         
         volume_slider.valueChanged.connect(on_volume_changed)
-        volume_slider.sliderReleased.connect(on_volume_released)
         volume_layout.addWidget(volume_slider)
         volume_layout.addWidget(volume_label)
         layout.addRow("Volume:", volume_layout)
         
-        # Initialize voice dropdown with current language
-        on_language_changed(current_lang)
-        
         return widget
-
+    
     @staticmethod
     def _parse_slider_value(raw_value: str, prefix_chars: str = "", suffix_chars: str = "%", default: int = 0) -> int:
         """Safely parse a config string like '+50%' or '-25Hz' into an int for a slider."""
@@ -498,7 +510,6 @@ class EdgeTTSBackend(BaseTTSBackend):
             elif error:
                 errors.append(error)
 
-        self._cleanup_chunk_temp()
         return (True, []) if success_count == len(texts) else (False, errors)
 
     def _generate_single(self, text: str, output_path: str) -> bool:
@@ -524,6 +535,7 @@ class EdgeTTSBackend(BaseTTSBackend):
             except ValueError:
                 volume = "+0%"
         
+        mp3_temp = None
         try:
             communicate = edge_tts.Communicate(
                 text=text.strip(),
@@ -538,7 +550,8 @@ class EdgeTTSBackend(BaseTTSBackend):
             # Save to a temporary MP3 file first, then convert to WAV if needed.
             base_temp = self.config.get('_temp_dir', '')
             if base_temp and os.path.isdir(base_temp):
-                mp3_temp = os.path.join(base_temp, f"edge_tmp_{id(communicate)}.mp3")
+                fd, mp3_temp = tempfile.mkstemp(suffix=".mp3", dir=base_temp)
+                os.close(fd)
             else:
                 mp3_temp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False).name
 
@@ -548,23 +561,32 @@ class EdgeTTSBackend(BaseTTSBackend):
                 # Convert MP3 → WAV
                 if self._convert_mp3_to_wav(mp3_temp, output_path):
                     self._safe_remove(mp3_temp)
+                    mp3_temp = None  # Prevent double deletion in finally
                 else:
                     # Conversion failed; move MP3 as a fallback with correct extension
                     fallback = output_path.replace('.wav', '.mp3')
                     shutil.move(mp3_temp, fallback)
+                    mp3_temp = None  # File was moved, not orphaned
                     logger.warning(f"[EdgeTTSBackend] WAV conversion failed, saved as MP3: {fallback}")
                     return False
             elif output_path.endswith('.mp3'):
                 shutil.move(mp3_temp, output_path)
+                mp3_temp = None  # File was moved
             else:
                 if self._convert_mp3_to_wav(mp3_temp, output_path):
                     self._safe_remove(mp3_temp)
+                    mp3_temp = None
                 else:
                     shutil.move(mp3_temp, output_path)
+                    mp3_temp = None
             
         except Exception as e:
             logger.error(f"[EdgeTTSBackend] Generation failed: {e}")
             return False
+        finally:
+            # Clean up leaked MP3 if an exception occurred before it could be moved/deleted
+            if mp3_temp:
+                self._safe_remove(mp3_temp)
         return True
     
     @staticmethod

@@ -25,7 +25,7 @@ from utils import (
     save_project_manifest, update_library_manifest
 )
 # Import the Backend Factory
-from backends import get_backend
+from backends import get_backend, get_all_audio_settings_keys
 
 # Import text chunker for validation
 from text_chunker import TextChunker, ChunkingConfig
@@ -79,25 +79,15 @@ class FFmpegCommandBuilder:
 # =================================================================
 
 def _get_audio_settings_hash(config: dict) -> str:
-    keys_to_hash = [
-        # Qwen3 settings
-        "qwen3_mode", "qwen3_size", 
-        "qwen3_device_map", "qwen3_dtype",
-        "qwen3_ref_audio", "qwen3_ref_text",
-        "qwen3_vd_ref_text", "qwen3_vd_ref_instruct", "qwen3_vd_ref_language",
-        "qwen3_model_id", "qwen3_voicedesign_model_id", "qwen3_clone_model_id",
-        "voice_references_root", "instruction_folder_root",
-        # Edge TTS settings
-        "edge_language", "edge_voice", "edge_rate", "edge_pitch", "edge_volume",
-        # Active backend
-        "active_backend",
-    ]
+    # Collect all audio-affecting keys from every registered backend
+    keys_to_hash = get_all_audio_settings_keys()
     data = {k: config.get(k) for k in keys_to_hash}
     
-    # Include file modification time for reference audio
-    ref_audio_path = config.get("qwen3_ref_audio", "")
-    if ref_audio_path and os.path.exists(ref_audio_path):
-        data["ref_audio_mtime"] = os.path.getmtime(ref_audio_path)
+    # Include file modification time for any reference audio files
+    for ref_key in ("qwen3_ref_audio", "omnivoice_ref_audio"):
+        ref_audio_path = config.get(ref_key, "")
+        if ref_audio_path and os.path.exists(ref_audio_path):
+            data[f"{ref_key}_mtime"] = os.path.getmtime(ref_audio_path)
     
     json_str = json.dumps(data, sort_keys=True)
     return hashlib.md5(json_str.encode('utf-8')).hexdigest()
@@ -127,8 +117,8 @@ def prepare_slide_tasks(html_files: List[str], ctx: RenderContext) -> List[Slide
         try:
             with open(manifest_path, 'r') as f:
                 manifest = json.load(f)
-        except:
-            pass
+        except (json.JSONDecodeError, OSError, KeyError) as e:
+            logger.warning(f"[Smart Cache] Could not load existing manifest: {e}")
 
     prev_audio_hash = manifest.get('audio_settings_hash', "")
     current_audio_hash = _get_audio_settings_hash(ctx.config)
@@ -295,12 +285,20 @@ async def process_audio_tasks(tasks: List[SlideTask], ctx: RenderContext, msg_qu
             
             error_messages = []
             for i, task in enumerate(tasks_to_generate):
-                err_msg = errors[i] if i < len(errors) else "Unknown error"
-                logger.error(f"Failed to generate slide {task.slide_number}: {err_msg}")
-                task.generation_error = err_msg
-                error_messages.append(f"Slide {task.slide_number}: {err_msg}")
+                # Only mark tasks that actually have a corresponding error
+                if i < len(errors) and errors[i]:
+                    err_msg = errors[i]
+                    logger.error(f"Failed to generate slide {task.slide_number}: {err_msg}")
+                    task.generation_error = err_msg
+                    error_messages.append(f"Slide {task.slide_number}: {err_msg}")
+                elif not os.path.exists(task.target_audio_path):
+                    # No specific error reported, but the file is missing
+                    err_msg = "File missing after generation"
+                    task.generation_error = err_msg
+                    error_messages.append(f"Slide {task.slide_number}: {err_msg}")
             
-            raise RuntimeError(f"Audio generation failed: {'; '.join(error_messages)}")
+            if error_messages:
+                raise RuntimeError(f"Audio generation failed: {'; '.join(error_messages)}")
 
     except Exception as e:
         logger.exception(f"[Worker] Critical error in backend execution: {e}")
@@ -373,14 +371,14 @@ def render_project_worker(project_path, msg_queue, config):
     reset_worker_logger()
     project_name = os.path.basename(project_path)
     logger.info(f"[WORKER {project_name}] Starting render worker")
-    output_dir = config.get('output_dir', 'Output')
     
     # =================================================================
     # TEMP DIR CONFIGURATION
     # =================================================================
     # Create temp folder in current working directory
-    cwd = os.getcwd()
-    temp_base_dir = os.path.join(cwd, "temp")
+    from config import AppConfig
+    app_root = AppConfig.APP_ROOT 
+    temp_base_dir = os.path.join(app_root, "temp")
     project_temp_dir = os.path.join(temp_base_dir, project_name)
 
     # Clean up any stale temp from a previous crashed run
@@ -409,7 +407,8 @@ def render_project_worker(project_path, msg_queue, config):
 
     # Async Runner
     async def run_async():
-        output_dir = config.get('output_dir', 'Output')
+        output_dir = os.path.abspath(config.get('output_dir', 'Output'))
+        os.makedirs(output_dir, exist_ok=True)
         final_video = os.path.join(output_dir, project_name + ".mp4")
         transition_duration = config.get('transition_duration', 0.5)
         transition_frames = int(transition_duration * config['fps'])
@@ -454,7 +453,8 @@ def render_project_worker(project_path, msg_queue, config):
             try:
                 with open(manifest_path, 'r') as f:
                     manifest = json.load(f)
-            except: pass
+            except Exception as e:
+                logger.error(f"[WORKER {project_name}] Error loading manifest: {e}")
 
         current_video_hash = _get_video_settings_hash(ctx.config)
         prev_video_hash = manifest.get('video_settings_hash', "")
@@ -566,87 +566,101 @@ def render_project_worker(project_path, msg_queue, config):
             raise Exception("Playwright not installed")
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=['--disable-gpu', '--no-sandbox'])
-            page = await browser.new_page()
-            await page.set_viewport_size({"width": config['width'], "height": config['height']})
-                
-            async def get_slide_image(index):
-                try:
-                    item = timeline[index]
-                    file_url = f"file:///{os.path.abspath(item['html']).replace(os.sep, '/')}"
-                    await page.goto(file_url, wait_until="domcontentloaded")
-                    
-                    try:
-                        await page.wait_for_load_state("networkidle", timeout=2000)
-                    except:
-                        pass
-                    
-                    await asyncio.sleep(0.1) # Small buffer
-                    
-                    img_bytes = await page.screenshot(type="jpeg", quality=85)
-                    img = Image.open(io.BytesIO(img_bytes))
-                    if img.mode != 'RGB': img = img.convert('RGB')
-                    return np.array(img)
-                except Exception as e:
-                    logger.error(f"[WORKER] Capture failed slide {index}: {e}")
-                    return np.zeros((config['height'], config['width'], 3), dtype=np.uint8)
-
-            img_current = await get_slide_image(0)
-            msg_queue.put((project_name, 1, len(timeline)))
-
-            total_slides = len(timeline)
-                
-            for i in range(total_slides):
-                if i < total_slides - 1:
-                    img_next = await get_slide_image(i + 1)
-                    msg_queue.put((project_name, i + 2, len(timeline)))
-                else:
-                    img_next = None
-
-                duration = timeline[i]['duration']
-                is_last = (i == total_slides - 1)
-                static_frames = max(0, int(math.ceil((duration - transition_duration) * config['fps']))) if not is_last else int(math.ceil(duration * config['fps']))
-                    
-                if static_frames > 0:
-                    for f_idx in range(static_frames):
-                        frame_to_write = img_current
+            try:
+                    browser = await p.chromium.launch(headless=True, args=['--disable-gpu', '--no-sandbox'])
+                    page = await browser.new_page()
+                    await page.set_viewport_size({"width": config['width'], "height": config['height']})
+                        
+                    async def get_slide_image(index):
                         try:
-                            if ffmpeg_proc.stdin:
-                                ffmpeg_proc.stdin.write(frame_to_write.tobytes())
-                        except BrokenPipeError:
-                            logger.error("[WORKER] FFmpeg pipe broken during static frame write.")
-                            # Log FFmpeg's error output for diagnosis
-                            if ffmpeg_proc and ffmpeg_proc.poll() is None:
-                                ffmpeg_proc.terminate()
-                            ffmpeg_log_path = os.path.join(ctx.temp_dir, "ffmpeg_encode.log")
-                            if os.path.exists(ffmpeg_log_path):
+                            item = timeline[index]
+                            file_url = f"file:///{os.path.abspath(item['html']).replace(os.sep, '/')}"
+                            await page.goto(file_url, wait_until="domcontentloaded")
+                            
+                            try:
+                                await page.wait_for_load_state("networkidle", timeout=2000)
+                            except:
+                                pass
+                            
+                            await asyncio.sleep(0.1) # Small buffer
+                            
+                            img_bytes = await page.screenshot(type="jpeg", quality=85)
+                            img = Image.open(io.BytesIO(img_bytes))
+                            if img.mode != 'RGB': img = img.convert('RGB')
+                            return np.array(img)
+                        except Exception as e:
+                            logger.error(f"[WORKER] Capture failed slide {index}: {e}")
+                            return np.zeros((config['height'], config['width'], 3), dtype=np.uint8)
+
+                    img_current = await get_slide_image(0)
+                    msg_queue.put((project_name, 1, len(timeline)))
+
+                    total_slides = len(timeline)
+                        
+                    for i in range(total_slides):
+                        if i < total_slides - 1:
+                            img_next = await get_slide_image(i + 1)
+                            msg_queue.put((project_name, i + 2, len(timeline)))
+                        else:
+                            img_next = None
+
+                        duration = timeline[i]['duration']
+                        is_last = (i == total_slides - 1)
+                        static_frames = max(0, int(math.ceil((duration - transition_duration) * config['fps']))) if not is_last else int(math.ceil(duration * config['fps']))
+                            
+                        if static_frames > 0:
+                            for f_idx in range(static_frames):
+                                frame_to_write = img_current
                                 try:
-                                    with open(ffmpeg_log_path, "r") as log_f:
-                                        last_lines = log_f.readlines()[-20:]
-                                        logger.error(f"[WORKER] FFmpeg log (last 20 lines):\n{''.join(last_lines)}")
-                                except Exception:
-                                    pass
-                            raise RuntimeError("[WORKER] FFmpeg pipe broken during static frame write.")
-                    
-                if not is_last and img_next is not None:
-                    start_frame = img_current
-                    end_frame = img_next
+                                    if ffmpeg_proc.stdin:
+                                        ffmpeg_proc.stdin.write(frame_to_write.tobytes())
+                                except BrokenPipeError:
+                                    logger.error("[WORKER] FFmpeg pipe broken during static frame write.")
+                                    # Log FFmpeg's error output for diagnosis
+                                    if ffmpeg_proc and ffmpeg_proc.poll() is None:
+                                        ffmpeg_proc.terminate()
+                                    ffmpeg_log_path = os.path.join(ctx.temp_dir, "ffmpeg_encode.log")
+                                    if os.path.exists(ffmpeg_log_path):
+                                        try:
+                                            with open(ffmpeg_log_path, "r") as log_f:
+                                                last_lines = log_f.readlines()[-20:]
+                                                logger.error(f"[WORKER] FFmpeg log (last 20 lines):\n{''.join(last_lines)}")
+                                        except Exception:
+                                            pass
+                                    raise RuntimeError("[WORKER] FFmpeg pipe broken during static frame write.")
+                            
+                        if not is_last and img_next is not None:
+                            start_frame = img_current
+                            end_frame = img_next
+                            try:
+                                for t in range(transition_frames):
+                                    alpha = t / transition_frames
+                                    blended = (start_frame * (1.0 - alpha) + end_frame * alpha).astype(np.uint8)
+                                    if ffmpeg_proc.stdin:
+                                        ffmpeg_proc.stdin.write(blended.tobytes())
+                            except BrokenPipeError:
+                                logger.error("[WORKER] FFmpeg pipe broken during transition.")
+                                if ffmpeg_proc and ffmpeg_proc.poll() is None:
+                                    ffmpeg_proc.terminate()
+                                raise RuntimeError("[WORKER] FFmpeg pipe broken during transition.")
+
+                        img_current = img_next
+
+                    await browser.close()
+                    logger.info(f"[WORKER {project_name}] Playwright closed. Writing frames.")
+            except Exception as playwright_err:
+                logger.error(f"[WORKER {project_name}] Playwright/Capture error: {playwright_err}")
+                # Ensure FFmpeg is killed if rendering crashes mid-stream
+                if ffmpeg_proc and ffmpeg_proc.poll() is None:
+                    ffmpeg_proc.terminate()
+                raise
+            finally:
+                # Always close stdin if it's still open to prevent FFmpeg hangs
+                if ffmpeg_proc and ffmpeg_proc.stdin and not ffmpeg_proc.stdin.closed:
                     try:
-                        for t in range(transition_frames):
-                            alpha = t / transition_frames
-                            blended = (start_frame * (1.0 - alpha) + end_frame * alpha).astype(np.uint8)
-                            if ffmpeg_proc.stdin:
-                                ffmpeg_proc.stdin.write(blended.tobytes())
-                    except BrokenPipeError:
-                        logger.error("[WORKER] FFmpeg pipe broken during transition.")
-                        if ffmpeg_proc and ffmpeg_proc.poll() is None:
-                            ffmpeg_proc.terminate()
-                        raise RuntimeError("[WORKER] FFmpeg pipe broken during transition.")
-
-                img_current = img_next
-
-            await browser.close()
-            logger.info(f"[WORKER {project_name}] Playwright closed. Writing frames.")
+                        ffmpeg_proc.stdin.close()
+                    except Exception:
+                        pass
 
         # =================================================================
         # FINALIZING
@@ -659,7 +673,8 @@ def render_project_worker(project_path, msg_queue, config):
                     if ffmpeg_proc.stdin: ffmpeg_proc.stdin.close()
                     ffmpeg_proc.wait()
                     logger.info(f"[WORKER {project_name}] FFmpeg process finished.")
-                except: pass
+                except Exception as e:
+                    logger.error(f"[WORKER {project_name}] Error waiting for FFmpeg process: {e}")
 
             logger.info(f"[WORKER {project_name}] Finalizing...")
             raw_video = os.path.join(ctx.temp_dir, "video_raw.mp4")
@@ -671,7 +686,9 @@ def render_project_worker(project_path, msg_queue, config):
                 for item in timeline:
                     # FIX: Use forward slashes for FFmpeg concat demuxer safety
                     abs_path = os.path.abspath(item['audio']).replace(os.sep, '/')
-                    f.write(f"file '{abs_path}'\n")
+                    # Escape single quotes for FFmpeg concat demuxer: replace ' with '\''
+                    escaped_path = abs_path.replace("'", "'\\''")
+                    f.write(f"file '{escaped_path}'\n")
                     
             audio_full = os.path.join(ctx.temp_dir, "audio_full.wav")
             
@@ -748,8 +765,8 @@ def render_project_worker(project_path, msg_queue, config):
                     if not remaining:
                         os.rmdir(parent_temp)
                         logger.info(f"[WORKER {project_name}] Removed empty parent temp directory: {parent_temp}")
-                except OSError:
-                    pass  # Not empty or permission issue, that's fine
+                except OSError: 
+                    logger.warning(f"[WORKER {project_name}] Failed to remove parent temp directory: {parent_temp}")
         except Exception as clean_e:
             logger.warning(f"[WORKER {project_name}] Failed to clean temp dir: {clean_e}")
 

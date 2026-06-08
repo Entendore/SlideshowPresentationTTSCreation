@@ -58,6 +58,32 @@ from utils import (logger, detect_ffmpeg, get_project_dirs,
                    get_theme, set_theme, list_themes, list_widget_stylesheet_from_theme,
                    setup_logging, initialize_project_files, get_library_status_data)
 
+def _project_list_stylesheet() -> str:
+    """Stylesheet for the project QListWidget that makes item
+    selection/hover transparent so the custom ProjectListItemWidget
+    is fully responsible for visual feedback."""
+    base = list_widget_stylesheet_from_theme()
+    return base + """
+        QListWidget::item {
+            background: transparent;
+            padding: 0px;
+            margin: 0px;
+            border: none;
+        }
+        QListWidget::item:selected {
+            background: transparent;
+            border: none;
+        }
+        QListWidget::item:hover {
+            background: transparent;
+            border: none;
+        }
+        QListWidget::item:selected:active {
+            background: transparent;
+            border: none;
+        }
+    """
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -71,6 +97,8 @@ class MainWindow(QMainWindow):
         self.active_processes = {}  
         self.pending_projects = []  
         self.render_queue = multiprocessing.Queue()
+
+        self._refreshing_library = False
         
         self.init_ui()
         setup_logging(self.log_text)
@@ -113,7 +141,7 @@ class MainWindow(QMainWindow):
         sort_layout = QHBoxLayout()
         sort_layout.setContentsMargins(0, 0, 0, 0)
         self.sort_combo = QComboBox()
-        self.sort_combo.addItems(["Name (A->Z)", "Name (Z->A)", "Status", "LastRendered"])
+        self.sort_combo.addItems(["Name (A->Z)", "Name (Z->A)", "Status", "Last Rendered"])
         self.sort_combo.setStyleSheet("background-color: #2d2d2d; color: #ffffff; border: 1px solid #555555; padding: 6px; border-radius: 4px;")
         self.sort_combo.currentIndexChanged.connect(self.refresh_library)
 
@@ -139,7 +167,7 @@ class MainWindow(QMainWindow):
         self.selection_mgr = ProjectSelectionManager(self.project_list)
         self.project_list.itemSelectionChanged.connect(self.selection_mgr.refresh)
 
-        self.project_list.setStyleSheet(list_widget_stylesheet_from_theme())
+        self.project_list.setStyleSheet(_project_list_stylesheet())
         left_layout.addWidget(self.project_list)
         
         lib_btn_layout = QHBoxLayout()
@@ -235,12 +263,9 @@ class MainWindow(QMainWindow):
                 self.tabs.setCurrentIndex(i)
                 return
         
-        self.settings_widget = SettingsTabWidget(self.config)
-        index = self.tabs.addTab(self.settings_widget, "⚙ Settings")
-        if initial:
-            self.tabs.setCurrentIndex(index)
-        else:
-            self.tabs.setCurrentIndex(index)
+        settings_widget = SettingsTabWidget(self.config)
+        index = self.tabs.addTab(settings_widget, "⚙ Settings")
+        self.tabs.setCurrentIndex(index)
 
     def open_project_tab(self, path):
         """Opens or switches to a Project Editor tab."""
@@ -271,24 +296,33 @@ class MainWindow(QMainWindow):
         self.tabs.removeTab(index)
 
     # --- LIBRARY & PROJECT MANAGEMENT ---
-
-    def on_library_selection_changed(self):
-        self.selection_mgr.refresh()
             
     def on_theme_changed(self, theme_name: str):
         try:
             set_theme(theme_name)
             logger.info(f"Switched to theme: {theme_name}")
-            self.project_list.setStyleSheet(list_widget_stylesheet_from_theme())
+            self.project_list.setStyleSheet(_project_list_stylesheet())
             self.refresh_library()
         except Exception as e:
             logger.error(f"Failed to change theme: {e}")
 
     def refresh_library(self):
-        """Reloads library with sorting logic using data from utils."""
+        """Reloads library with sorting logic using data from utils.
+        Guarded against recursive calls."""
+        if self._refreshing_library:
+            return
+        self._refreshing_library = True
+        try:
+            self._do_refresh_library()
+        finally:
+            self._refreshing_library = False
+
+    def _do_refresh_library(self):
+        """Internal implementation of library refresh."""
         current_selection = self.get_selected_project_path()
         self.project_dirs = get_project_dirs()
         
+        self.project_list.blockSignals(True)
         self.project_list.clear()
         
         project_data = get_library_status_data(self.project_dirs, self.active_processes, self.pending_projects)
@@ -305,7 +339,7 @@ class MainWindow(QMainWindow):
             project_data.sort(key=lambda x: x["last_rendered"], reverse=True)
 
         for pd in project_data:
-            list_widget = ProjectListItemWidget(pd["name"], pd["path"],self.selection_mgr.state)
+            list_widget = ProjectListItemWidget(pd["name"], pd["path"], self.selection_mgr.state)
             list_widget.update_status(pd["status"], 0, pd["detail"])
             
             item = QListWidgetItem()
@@ -314,7 +348,9 @@ class MainWindow(QMainWindow):
             
             self.project_list.addItem(item)
             self.project_list.setItemWidget(item, list_widget)
-            
+        
+        self.project_list.blockSignals(False)
+
         if current_selection:
             self.selection_mgr.select_path(current_selection)
 
@@ -345,9 +381,17 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentIndex(index)
 
     def on_new_project_created(self, project_path):
-        """Callback when a project is created via the tab."""
-        self.refresh_library()
-        self.open_project_tab(project_path)
+        """Callback when a project is created via the tab.
+        Uses deferred execution to avoid conflicts with process_queue timer."""
+        QTimer.singleShot(0, lambda: self._handle_new_project(project_path))
+
+    def _handle_new_project(self, project_path):
+        """Safely handle new project creation after deferral."""
+        try:
+            self.refresh_library()
+            self.open_project_tab(project_path)
+        except Exception as e:
+            logger.error(f"Error handling new project: {e}")
 
     def filter_library(self):
         query = self.search_edit.text().strip().lower()
@@ -425,7 +469,7 @@ class MainWindow(QMainWindow):
     def delete_project_for(self, path):
         if path in self.pending_projects:
             self.pending_projects.remove(path)
-            logger.info(f" removed {path} from queue.")
+            logger.info(f"Removed {path} from queue.")
             self.refresh_library()
             return
         for pid, p_info in self.active_processes.items():
@@ -521,22 +565,31 @@ class MainWindow(QMainWindow):
         for path in paths:
             needs_render = not should_skip_render(path, self.config.settings)
             if needs_render:
-                self.add_to_queue(path)
-                count += 1
+                # Only increment if the project is actually added to the queue
+                is_active = any(p['path'] == path for p in self.active_processes.values())
+                is_queued = path in self.pending_projects
+                
+                if not is_active and not is_queued:
+                    self.add_to_queue(path)
+                    count += 1
+        
+        if count > 0:
+            self.refresh_library()
         
         if count == 0:
             QMessageBox.information(self, "Up to Date", "All projects are already up to date based on current settings.")
         else:
             logger.info(f"Added {count} outdated projects to render queue.")
 
-    def add_to_queue(self, project_path):
+    def add_to_queue(self, project_path, refresh=True):
         if project_path in self.pending_projects: return
         for p_info in self.active_processes.values():
             if p_info['path'] == project_path: return
 
         self.pending_projects.append(project_path)
         self.update_stats()
-        self.refresh_library() 
+        if refresh:
+            self.refresh_library() 
             
         if not self.scheduler_timer.isActive():
             self.scheduler_timer.start(500)
@@ -555,10 +608,14 @@ class MainWindow(QMainWindow):
 
         self.btn_stop.setEnabled(True)
 
-        active_count = len(self.active_processes)
-        if active_count < self.max_workers and self.pending_projects:
+        # Start as many workers as free slots allow
+        started = False
+        while len(self.active_processes) < self.max_workers and self.pending_projects:
             next_project = self.pending_projects.pop(0)
             self.start_worker(next_project)
+            started = True
+
+        if started:
             self.update_stats()
             self.refresh_library()
 
@@ -584,7 +641,7 @@ class MainWindow(QMainWindow):
 
     def _cleanup_stale_temp(self):
         """Remove any leftover temp directories from previous crashed runs."""
-        temp_base = os.path.join(os.getcwd(), "temp")
+        temp_base = os.path.join(AppConfig.APP_ROOT, "temp")
         if not os.path.isdir(temp_base):
             return
         
@@ -634,7 +691,7 @@ class MainWindow(QMainWindow):
             
             # Force-clean this project's local temp dir since the worker's 
             # finally block may not execute after kill()
-            temp_dir = os.path.join(os.getcwd(), "temp", project_name)
+            temp_dir = os.path.join(AppConfig.APP_ROOT, "temp", project_name)
             if os.path.exists(temp_dir):
                 try:
                     shutil.rmtree(temp_dir, ignore_errors=True)
@@ -667,6 +724,7 @@ class MainWindow(QMainWindow):
             logger.error(f"Queue processing error: {e}")
 
         active_pids = list(self.active_processes.keys())
+        dead_found = False
         for pid in active_pids:
             proc_data = self.active_processes[pid]
             proc = proc_data['proc']
@@ -684,9 +742,11 @@ class MainWindow(QMainWindow):
                     logger.error(f"Worker {pid} crashed.")
 
                 del self.active_processes[pid]
-                self.update_stats()
-                
-                self.schedule_jobs()
+                dead_found = True
+
+        if dead_found:
+            self.update_stats()
+            self.schedule_jobs()
 
     def handle_message(self, msg):
         if not isinstance(msg, tuple): return
@@ -756,14 +816,18 @@ class MainWindow(QMainWindow):
                 self.progress_bar.setValue(90)
                 self.update_item_status(project_name, "rendering", "Finalizing Video...")
 
-    def update_item_status(self, project_name, status, progress_text=""):
-        """Updates the widget during rendering."""
+    def update_item_status(self, project_name, status, progress_text="", project_path=None):
+        """Updates the widget during rendering.
+        Uses project_path for exact matching if provided, otherwise falls back to basename.
+        """
         for i in range(self.project_list.count()):
             item = self.project_list.item(i)
-
             path = item.data(Qt.ItemDataRole.UserRole)
             
-            if os.path.basename(path) == project_name:
+            # Exact match if path is provided, otherwise fall back to basename
+            is_match = (path == project_path) if project_path else (os.path.basename(path) == project_name)
+            
+            if is_match:
                 widget = self.project_list.itemWidget(item)
                 if widget:
                     pct = 0
@@ -772,7 +836,7 @@ class MainWindow(QMainWindow):
                         try:
                             pct = int(progress_text.split("(")[-1].replace("%", ""))
                             detail = "Rendering..."
-                        except:
+                        except (ValueError, IndexError):
                             detail = "Processing..."
                     elif status == "ready":
                         detail = "Completed"
@@ -786,12 +850,13 @@ class MainWindow(QMainWindow):
         self.lbl_queue_count.setText(f"Queue: {len(self.pending_projects)}")
 
     def closeEvent(self, event):
-        # Flush settings on all open Settings tabs
+        # ── Flush ALL open tabs (settings + slide editors) ──
         for i in range(self.tabs.count()):
             w = self.tabs.widget(i)
             if isinstance(w, SettingsTabWidget):
                 w._flush_pending_settings()
-                break
+            elif isinstance(w, SlideEditorTabWidget):
+                w.save_and_cleanup()
 
         if self.active_processes:
             reply = QMessageBox.question(
@@ -804,11 +869,18 @@ class MainWindow(QMainWindow):
             if reply == QMessageBox.StandardButton.No:
                 event.ignore()
                 return
+
+            self.queue_timer.stop()
+            self.scheduler_timer.stop()
             self.stop_all_renders()
-            # Give processes 2 seconds to terminate gracefully
             for pid, proc_data in list(self.active_processes.items()):
                 proc_data['proc'].join(timeout=2.0)
+        else:
+            self.queue_timer.stop()
+            self.scheduler_timer.stop()
 
+        self.config.save()
+        QApplication.processEvents()
         event.accept()
 
 if __name__ == "__main__":

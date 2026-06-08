@@ -10,12 +10,13 @@ import threading
 import platform
 import subprocess
 import glob
+import weakref
 
 from PySide6.QtWidgets import (
-    QWidget, QFormLayout, QSpinBox, QDoubleSpinBox, QFrame, 
-    QApplication, QComboBox, QPushButton, QHBoxLayout, QVBoxLayout, 
-    QSplitter, QMessageBox, QSizePolicy, QTextEdit, QGroupBox, 
-    QCheckBox, QLabel, QLineEdit, QFileDialog, QTabWidget, 
+    QWidget, QFormLayout, QSpinBox, QDoubleSpinBox, QFrame,
+    QApplication, QComboBox, QPushButton, QHBoxLayout, QVBoxLayout,
+    QSplitter, QMessageBox, QSizePolicy, QTextEdit, QGroupBox,
+    QCheckBox, QLabel, QLineEdit, QFileDialog, QTabWidget,
     QPlainTextEdit, QStackedWidget, QListWidget, QListWidgetItem, QScrollArea,
     QInputDialog
 )
@@ -29,7 +30,25 @@ from utils import (
     create_slide_file, get_default_slide_html, get_blank_slide_html
 )
 from config import AppConfig
-import backends 
+import backends
+
+
+# =================================================================
+# ILLEGAL FILENAME CHARACTERS (cross-platform)
+# =================================================================
+
+_ILLEGAL_NAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _sanitize_project_name(name: str) -> str:
+    """Remove characters that are illegal in directory names on
+    Windows, macOS, or Linux.  Also strips leading/trailing whitespace
+    and dots (trailing dots are invalid on Windows)."""
+    name = name.strip()
+    name = _ILLEGAL_NAME_RE.sub('_', name)
+    name = name.rstrip('.')
+    return name
+
 
 # =================================================================
 # CUSTOM WIDGETS
@@ -45,7 +64,8 @@ class StatusStrip(QFrame):
     Self-contained: accepts a color and renders itself.
     """
     STRIP_WIDTH = 5
-    STRIP_RADIUS = "3px 0px 0px 3px"
+    STRIP_RADIUS_TOP = "3px"
+    STRIP_RADIUS_BOT = "3px"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -60,8 +80,8 @@ class StatusStrip(QFrame):
     def _apply_style(self):
         self.setStyleSheet(
             f"background-color: {self._color}; "
-            f"border-top-left-radius: {self.STRIP_RADIUS.split()[0]}; "
-            f"border-bottom-left-radius: {self.STRIP_RADIUS.split()[2]};"
+            f"border-top-left-radius: {self.STRIP_RADIUS_TOP}; "
+            f"border-bottom-left-radius: {self.STRIP_RADIUS_BOT};"
         )
 
 
@@ -302,6 +322,7 @@ class ProjectListItemWidget(QWidget):
         self.setFixedHeight(self.ITEM_HEIGHT)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setMouseTracking(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
 
         self._build_ui()
         self._apply_visual_state()
@@ -340,7 +361,6 @@ class ProjectListItemWidget(QWidget):
         """Set selection state and update visuals immediately."""
         if selected:
             self._sel_state.select(self.path)
-        # We don't deselect here — that's the SelectionManager's job
         self._apply_visual_state()
 
     def is_selected(self) -> bool:
@@ -415,7 +435,24 @@ class ProjectListItemWidget(QWidget):
         """Click self-selects and also notifies the QListWidget."""
         if event.button() == Qt.MouseButton.LeftButton:
             self.set_selected(True)
+            list_widget = self._find_parent_list()
+            if list_widget:
+                for i in range(list_widget.count()):
+                    item = list_widget.item(i)
+                    w = list_widget.itemWidget(item)
+                    if w is self:
+                        list_widget.setCurrentItem(item)
+                        break
         super().mousePressEvent(event)
+
+    def _find_parent_list(self) -> QListWidget | None:
+        """Walk up the widget hierarchy to find the parent QListWidget."""
+        p = self.parent()
+        while p is not None:
+            if isinstance(p, QListWidget):
+                return p
+            p = p.parent()
+        return None
 
     # ── Helpers ──────────────────────────────────────────────────
 
@@ -475,7 +512,6 @@ class ProjectSelectionManager:
         self._state.select(path)
         self._update_all_widgets()
 
-        # Also update the QListWidget's selection model
         for i in range(self._list.count()):
             item = self._list.item(i)
             if item.data(Qt.ItemDataRole.UserRole) == path:
@@ -495,26 +531,42 @@ class ProjectSelectionManager:
 
 
 class QTextEditLogger(logging.Handler):
-    """Custom logging handler that writes to a QTextEdit."""
+    """Custom logging handler that writes to a QTextEdit.
+
+    Uses a weak reference to the QTextEdit so that if the widget is
+    destroyed by Qt before the handler is removed, we won't crash
+    trying to call invokeMethod on a dangling C++ pointer.
+    """
     def __init__(self, text_edit):
         super().__init__()
-        self.text_edit = text_edit
-        self.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S'))
+        self._text_edit_ref = weakref.ref(text_edit)
+        self.setFormatter(logging.Formatter(
+            '%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S'
+        ))
 
     def emit(self, record):
         try:
-            if not self.text_edit: return
+            text_edit = self._text_edit_ref()
+            if text_edit is None:
+                return
             msg = self.format(record)
             msg = html.escape(msg)
             msg = msg.replace("\n", "<br>")
-            color = "#d4d4d4" 
-            if record.levelno >= logging.ERROR: color = "#ff6b6b"
-            elif record.levelno >= logging.WARNING: color = "#f1c40f"
-            elif record.levelname == "INFO": color = "#3498db"
+            color = "#d4d4d4"
+            if record.levelno >= logging.ERROR:
+                color = "#ff6b6b"
+            elif record.levelno >= logging.WARNING:
+                color = "#f1c40f"
+            elif record.levelname == "INFO":
+                color = "#3498db"
             html_msg = f'<span style="color:{color}">{msg}</span>'
-            
-            QMetaObject.invokeMethod(self.text_edit, "append", Qt.ConnectionType.QueuedConnection, html_msg)
-        except Exception: self.handleError(record)
+
+            QMetaObject.invokeMethod(
+                text_edit, "append",
+                Qt.ConnectionType.QueuedConnection, html_msg
+            )
+        except Exception:
+            self.handleError(record)
 
 
 # =================================================================
@@ -523,38 +575,47 @@ class QTextEditLogger(logging.Handler):
 
 class SettingsTabWidget(QWidget):
     """Widget to be embedded in a QTabWidget for settings."""
-    
-    log_signal = Signal(str)
-    settings_changed = Signal(str, object)  # (key, value) — emitted on every debounced change
 
-    AUTO_SAVE_DELAY_MS = 600  # debounce interval for rapidly-changing settings
+    log_signal = Signal(str)
+    settings_changed = Signal(str, object)  # (key, value)
+
+    AUTO_SAVE_DELAY_MS = 600
+
+    # Resolution presets: (display_name, landscape_width, landscape_height)
+    RESOLUTION_PRESETS = [
+        ("4K UHD (2160p)",  3840, 2160),
+        ("1440p QHD",       2560, 1440),
+        ("1080p FHD",       1920, 1080),
+        ("720p HD",         1280, 720),
+        ("540p qHD",        960,  540),
+        ("480p SD",         854,  480),
+        ("360p",            640,  360),
+    ]
 
     def __init__(self, config, parent=None):
         super().__init__(parent)
         self.config = config
-        
-        # Debounce timer for settings that change rapidly (text fields, etc.)
+
+        # Debounce timer for settings that change rapidly
         self._settings_timer = QTimer(self)
         self._settings_timer.setSingleShot(True)
         self._settings_timer.setInterval(self.AUTO_SAVE_DELAY_MS)
         self._settings_timer.timeout.connect(self._flush_pending_settings)
-        self._pending_settings: dict = {}  # key -> value, accumulated between flushes
-        
-        self.backend_descriptions = {
-            "qwen3": "Qwen-Audio: High quality speech synthesis. Supports emotion and style. Requires moderate VRAM.",
-            "bark": "Bark: Transformer-based text-to-audio model capable of generating highly realistic multilingual speech and sound effects.",
-            "tortoise": "Tortoise-TTS: Multi-voice TTS known for very high quality prosody, though slower generation speed.",
-            "default": "Generic backend implementation."
-        }
-        
+        self._pending_settings: dict = {}
+
+        self.backend_descriptions = backends.get_backend_descriptions()
+
         # Main Layout
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
-        
+
         # Search Bar
         self.search_bar = QLineEdit()
         self.search_bar.setPlaceholderText("Search settings...")
-        self.search_bar.setStyleSheet("padding: 5px; background: #333; color: white; border-radius: 0px; border-bottom: 1px solid #444;")
+        self.search_bar.setStyleSheet(
+            "padding: 5px; background: #333; color: white; "
+            "border-radius: 0px; border-bottom: 1px solid #444;"
+        )
         self.search_bar.textChanged.connect(self.filter_sidebar)
         main_layout.addWidget(self.search_bar)
 
@@ -571,14 +632,14 @@ class SettingsTabWidget(QWidget):
             QListWidget::item:selected { background-color: #007acc; color: white; }
             QListWidget::item:hover { background-color: #2d2d30; }
         """)
-        
+
         self.sidebar.addItem("General & Video")
         self.sidebar.addItem("Backend Settings")
         self.sidebar.addItem("Hardware & Performance")
         self.sidebar.addItem("Text Chunking")
         self.sidebar.addItem("Paths & Cache")
         self.sidebar.addItem("Diagnostics")
-        
+
         self.sidebar.setCurrentRow(0)
         self.sidebar.currentRowChanged.connect(self.change_page)
         splitter.addWidget(self.sidebar)
@@ -607,19 +668,31 @@ class SettingsTabWidget(QWidget):
         self._save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
         self._save_shortcut.activated.connect(self._flush_pending_settings)
 
-        # Initialize
-        self.refresh_ui_values()
-        self.refresh_backend_settings_ui()
+        # Initialize — block signals so programmatic setValue/setText
+        # calls don't cascade through _debounce_set during init.
+        self.blockSignals(True)
+        try:
+            self.refresh_ui_values()
+            self.refresh_backend_settings_ui()
+        finally:
+            self.blockSignals(False)
 
     # ==========================================================
     # DEBOUNCED SETTINGS HELPER
     # ==========================================================
     def _debounce_set(self, key, value):
         """
-        Queue a settings change. The value is written to config (and disk)
-        after the debounce timer fires, or immediately on Ctrl+S.
+        Queue a settings change.  Skips work entirely when the new
+        value is identical to the current in-memory value, preventing
+        spurious writes during refresh_ui_values() or widget init.
         """
+        current = self.config.settings.get(key)
+        if current == value and key not in self._pending_settings:
+            return  # nothing to do
+
         self._pending_settings[key] = value
+        # Apply to in-memory settings immediately so reads are consistent
+        self.config.settings[key] = value
         self._settings_timer.start()  # restart the debounce window
         self.settings_changed.emit(key, value)
 
@@ -631,6 +704,69 @@ class SettingsTabWidget(QWidget):
             self.config.set(key, value)
         self._pending_settings.clear()
         logger.debug("[Settings] Flushed pending settings to disk.")
+
+    # ==========================================================
+    # RESOLUTION HELPERS
+    # ==========================================================
+    def _apply_resolution_to_config(self):
+        """Read current combo values and write width/height to config."""
+        data = self.resolution_combo.currentData()
+        orientation = self.orientation_combo.currentData()
+        if data:
+            base_w, base_h = data
+            if orientation == "portrait":
+                w, h = base_h, base_w
+            else:
+                w, h = base_w, base_h
+            self._debounce_set('width', w)
+            self._debounce_set('height', h)
+        self._update_resolution_preview()
+
+    def _update_resolution_preview(self):
+        """Update the small label showing the actual pixel dimensions."""
+        data = self.resolution_combo.currentData()
+        orientation = self.orientation_combo.currentData()
+        if data:
+            base_w, base_h = data
+            if orientation == "portrait":
+                w, h = base_h, base_w
+            else:
+                w, h = base_w, base_h
+            self.resolution_preview.setText(f"Output: {w}x{h} pixels")
+        else:
+            self.resolution_preview.setText("")
+
+    def _sync_resolution_combos(self):
+        """Set resolution and orientation combos from current config width/height."""
+        w = self.config.get('width', 1280)
+        h = self.config.get('height', 720)
+
+        # Determine orientation
+        if h > w:
+            orientation = "portrait"
+            base_w, base_h = h, w  # swap to landscape reference
+        else:
+            orientation = "landscape"
+            base_w, base_h = w, h
+
+        # Find matching preset
+        for i in range(self.resolution_combo.count()):
+            data = self.resolution_combo.itemData(i)
+            if data and data[0] == base_w and data[1] == base_h:
+                self.resolution_combo.blockSignals(True)
+                self.resolution_combo.setCurrentIndex(i)
+                self.resolution_combo.blockSignals(False)
+                break
+
+        # Set orientation
+        orient_idx = self.orientation_combo.findData(orientation)
+        if orient_idx >= 0:
+            self.orientation_combo.blockSignals(True)
+            self.orientation_combo.setCurrentIndex(orient_idx)
+            self.orientation_combo.blockSignals(False)
+
+        # Update preview label
+        self._update_resolution_preview()
 
     # ==========================================================
     # NAVIGATION
@@ -646,32 +782,42 @@ class SettingsTabWidget(QWidget):
 
     def refresh_ui_values(self):
         """Reloads UI from config."""
-        # General
-        self.width_spin.setValue(self.config.get('width', 1280))
-        self.height_spin.setValue(self.config.get('height', 720))
+        # General — Resolution
+        self._sync_resolution_combos()
         self.fps_spin.setValue(self.config.get('fps', 30))
         self.enc_combo.setCurrentText(self.config.get('encoder', 'auto'))
         self.worker_spin.setValue(self.config.get('render_workers', 3))
         self.out_dir_edit.setText(self.config.get('output_dir', 'Output'))
+        self.proj_root_edit.setText(self.config.get('projects_root', 'Projects'))
         self.trans_spin.setValue(self.config.get('transition_duration', 0.5))
 
         # Backend Settings
         current_backend = self.config.get('active_backend', 'qwen3')
         index = self.backend_combo.findData(current_backend)
-        if index >= 0: self.backend_combo.setCurrentIndex(index)
+        if index >= 0:
+            self.backend_combo.setCurrentIndex(index)
 
-        # Hardware
-        self.qwen3_device_combo.setCurrentText(self.config.get('qwen3_device_map', 'cuda:0'))
-        self.qwen3_dtype_combo.setCurrentText(self.config.get('qwen3_dtype', 'bfloat16'))
-        self.chk_flash_attn.setChecked(self.config.get('qwen3_attn_implementation') == "flash_attention_2")
-        self.qwen3_size_combo.setCurrentText(self.config.get('qwen3_size', '1.7B'))
+        # Hardware — fixed fallback to match config default
+        self.qwen3_device_combo.setCurrentText(
+            self.config.get('qwen3_device_map', 'cuda:0'))
+        self.qwen3_dtype_combo.setCurrentText(
+            self.config.get('qwen3_dtype', 'float16'))
+        self.chk_flash_attn.setChecked(
+            self.config.get('qwen3_attn_implementation') == "flash_attention_2")
+        self.qwen3_size_combo.setCurrentText(
+            self.config.get('qwen3_size', '1.7B'))
 
         # Text Chunking
-        self.chk_enable_chunking.setChecked(self.config.get('enable_text_chunking', True))
-        self.spin_chunk_max_chars.setValue(self.config.get('chunk_max_chars', 500))
-        self.spin_chunk_max_sentences.setValue(self.config.get('chunk_max_sentences', 5))
-        self.spin_chunk_min_chars.setValue(self.config.get('chunk_min_chars', 50))
-        self.spin_warn_threshold.setValue(self.config.get('chunk_warn_threshold', 1000))
+        self.chk_enable_chunking.setChecked(
+            self.config.get('enable_text_chunking', True))
+        self.spin_chunk_max_chars.setValue(
+            self.config.get('chunk_max_chars', 500))
+        self.spin_chunk_max_sentences.setValue(
+            self.config.get('chunk_max_sentences', 5))
+        self.spin_chunk_min_chars.setValue(
+            self.config.get('chunk_min_chars', 50))
+        self.spin_warn_threshold.setValue(
+            self.config.get('chunk_warn_threshold', 1000))
 
     # ==========================================================
     # PAGE: GENERAL & VIDEO
@@ -680,51 +826,81 @@ class SettingsTabWidget(QWidget):
         page = QWidget()
         layout = QFormLayout(page)
 
+        # Create preview label BEFORE populating combos so that
+        # currentIndexChanged signals fired during addItem can safely
+        # reference self.resolution_preview.
+        self.resolution_preview = QLabel("")
+        self.resolution_preview.setStyleSheet(
+            "color: #888888; font-size: 11px; padding-left: 2px;")
+
         res_layout = QHBoxLayout()
-        self.width_spin = QSpinBox()
-        self.width_spin.setRange(640, 3840)
-        self.width_spin.valueChanged.connect(lambda v: self._debounce_set('width', v))
-        self.height_spin = QSpinBox()
-        self.height_spin.setRange(480, 2160)
-        self.height_spin.valueChanged.connect(lambda v: self._debounce_set('height', v))
-        res_layout.addWidget(self.width_spin)
-        res_layout.addWidget(QLabel("x"))
-        res_layout.addWidget(self.height_spin)
+        self.resolution_combo = QComboBox()
+        self.resolution_combo.blockSignals(True)
+        for name, w, h in SettingsTabWidget.RESOLUTION_PRESETS:
+            self.resolution_combo.addItem(name, (w, h))
+        self.resolution_combo.blockSignals(False)
+
+        self.orientation_combo = QComboBox()
+        self.orientation_combo.blockSignals(True)
+        self.orientation_combo.addItem("Landscape (Horizontal)", "landscape")
+        self.orientation_combo.addItem("Portrait (Vertical)", "portrait")
+        self.orientation_combo.blockSignals(False)
+
+        self.resolution_combo.currentIndexChanged.connect(
+            self._apply_resolution_to_config)
+        self.orientation_combo.currentIndexChanged.connect(
+            self._apply_resolution_to_config)
+
+        res_layout.addWidget(self.resolution_combo, stretch=3)
+        res_layout.addWidget(self.orientation_combo, stretch=2)
         layout.addRow("Resolution:", res_layout)
-        
+        layout.addRow("", self.resolution_preview)
+
         self.fps_spin = QSpinBox()
         self.fps_spin.setRange(10, 60)
-        self.fps_spin.valueChanged.connect(lambda v: self._debounce_set('fps', v))
+        self.fps_spin.valueChanged.connect(
+            lambda v: self._debounce_set('fps', v))
         layout.addRow("FPS:", self.fps_spin)
-        
+
         self.enc_combo = QComboBox()
         self.enc_combo.addItems(["auto", "libx264", "h264_nvenc"])
-        self.enc_combo.currentIndexChanged.connect(lambda i: self.config.set('encoder', self.enc_combo.itemText(i)))
+        self.enc_combo.currentIndexChanged.connect(
+            lambda i: self._debounce_set('encoder', self.enc_combo.itemText(i))
+        )
         layout.addRow("Encoder:", self.enc_combo)
-        
+
         self.worker_spin = QSpinBox()
         self.worker_spin.setRange(1, 8)
-        self.worker_spin.valueChanged.connect(lambda v: self.config.set('render_workers', v))
+        self.worker_spin.valueChanged.connect(
+            lambda v: self._debounce_set('render_workers', v))
         layout.addRow("Render Workers:", self.worker_spin)
 
         # Output Directory
         out_layout = QHBoxLayout()
         self.out_dir_edit = QLineEdit()
         self.out_dir_edit.setText(self.config.get('output_dir', 'Output'))
-        self.out_dir_edit.editingFinished.connect(lambda: self.config.set('output_dir', self.out_dir_edit.text()))
+        self.out_dir_edit.editingFinished.connect(
+            lambda: self._debounce_set('output_dir', self.out_dir_edit.text())
+        )
         btn_browse = QPushButton("Browse...")
         btn_browse.clicked.connect(self.browse_output_dir)
         out_layout.addWidget(self.out_dir_edit)
         out_layout.addWidget(btn_browse)
         layout.addRow("Output Dir:", out_layout)
 
-        # Projects Root
+        # Projects Root — now passes config_key for reliable persistence
         proj_layout = QHBoxLayout()
         self.proj_root_edit = QLineEdit()
         self.proj_root_edit.setText(self.config.get('projects_root', 'Projects'))
-        self.proj_root_edit.editingFinished.connect(lambda: self.config.set('projects_root', self.proj_root_edit.text()))
+        self.proj_root_edit.editingFinished.connect(
+            lambda: self._debounce_set('projects_root',
+                                       self.proj_root_edit.text())
+        )
         btn_browse_proj = QPushButton("Browse...")
-        btn_browse_proj.clicked.connect(lambda: self.browse_generic(self.proj_root_edit, True))
+        btn_browse_proj.clicked.connect(
+            lambda: self.browse_generic(
+                self.proj_root_edit, True, config_key='projects_root')
+        )
         proj_layout.addWidget(self.proj_root_edit)
         proj_layout.addWidget(btn_browse_proj)
         layout.addRow("Projects Root:", proj_layout)
@@ -733,19 +909,10 @@ class SettingsTabWidget(QWidget):
         self.trans_spin.setRange(0.0, 10.0)
         self.trans_spin.setSingleStep(0.1)
         self.trans_spin.setSuffix(" s")
-        self.trans_spin.valueChanged.connect(lambda v: self._debounce_set('transition_duration', v))
+        self.trans_spin.valueChanged.connect(
+            lambda v: self._debounce_set('transition_duration', v))
         layout.addRow("Transition Duration:", self.trans_spin)
 
-        self.chk_zoom = QCheckBox("Enable Ken Burns (Slow Zoom)")
-        self.chk_zoom.toggled.connect(lambda c: self.config.set('enable_zoom', c))
-        layout.addRow(self.chk_zoom)
-        
-        self.spin_zoom = QDoubleSpinBox()
-        self.spin_zoom.setRange(1.01, 2.0)
-        self.spin_zoom.setSingleStep(0.05)
-        self.spin_zoom.setSuffix("x")
-        self.spin_zoom.valueChanged.connect(lambda v: self._debounce_set('zoom_factor', v))
-        layout.addRow("Max Zoom:", self.spin_zoom)
         return page
 
     # ==========================================================
@@ -760,26 +927,28 @@ class SettingsTabWidget(QWidget):
         header_layout = QVBoxLayout()
         title = QLabel("<h2>Backend Configuration</h2>")
         header_layout.addWidget(title)
-        
+
         selector_layout = QHBoxLayout()
         selector_layout.addWidget(QLabel("<b>Active Engine:</b>"))
-        
+
         self.backend_combo = QComboBox()
         for name in backends.BACKEND_MAP.keys():
             display_name = name.replace("_", " ").title()
             self.backend_combo.addItem(display_name, name)
-        
-        self.backend_combo.currentIndexChanged.connect(self.on_backend_selection_changed)
+
+        self.backend_combo.currentIndexChanged.connect(
+            self.on_backend_selection_changed)
         selector_layout.addWidget(self.backend_combo, 1)
-        
+
         # Mode Selector
         self.mode_label = QLabel("Mode:")
         self.mode_combo = QComboBox()
-        self.mode_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.mode_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
         selector_layout.addWidget(self.mode_label)
         selector_layout.addWidget(self.mode_combo)
-        
+
         selector_layout.addStretch()
         header_layout.addLayout(selector_layout)
 
@@ -793,69 +962,71 @@ class SettingsTabWidget(QWidget):
         # 2. Scroll Area for Content
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        
+
         scroll_content = QWidget()
         self.scroll_layout = QVBoxLayout(scroll_content)
         self.scroll_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        
+
         # Group: Backend Parameters
         self.backend_params_group = QGroupBox("Backend Specific Parameters")
         self.backend_params_layout = QVBoxLayout()
         self.backend_params_group.setLayout(self.backend_params_layout)
         self.scroll_layout.addWidget(self.backend_params_group)
-        
+
         # Group: Diagnostics & Testing
         diag_group = QGroupBox("Diagnostics & Testing")
         diag_layout = QVBoxLayout()
-        diag_layout.addWidget(QLabel("Run backend diagnostics from the Diagnostics sidebar page."))
+        diag_layout.addWidget(
+            QLabel("Run backend diagnostics from the Diagnostics sidebar page."))
         diag_group.setLayout(diag_layout)
         self.scroll_layout.addWidget(diag_group)
 
         self.scroll_layout.addStretch()
-        
+
         scroll.setWidget(scroll_content)
         main_layout.addWidget(scroll)
-        
+
         return page
 
     def on_backend_selection_changed(self, index):
         backend_name = self.backend_combo.currentData()
-        self.config.set('active_backend', backend_name)
+        self._debounce_set('active_backend', backend_name)
         self.refresh_backend_settings_ui()
 
     def on_mode_changed(self, index):
         backend_name = self.config.get('active_backend', 'qwen3')
         mode_key = self.mode_combo.currentData()
-        
-        self.config.set(f"{backend_name}_mode", mode_key)
+        self._debounce_set(f"{backend_name}_mode", mode_key)
         self.load_backend_widget()
 
     def refresh_backend_settings_ui(self):
         backend_name = self.config.get('active_backend', 'qwen3')
-        
-        desc = self.backend_descriptions.get(backend_name, self.backend_descriptions.get("default"))
-        self.backend_desc_label.setText(f"<b>{backend_name.upper()}</b>: {desc}")
+
+        desc = self.backend_descriptions.get(
+            backend_name, self.backend_descriptions.get("default"))
+        self.backend_desc_label.setText(
+            f"<b>{backend_name.upper()}</b>: {desc}")
 
         backend_class = backends.BACKEND_MAP.get(backend_name)
         has_modes = False
-        
+
         if backend_class and hasattr(backend_class, 'get_ui_options'):
             options = backend_class.get_ui_options()
             modes = options.get("modes", [])
-            
+
             if modes:
                 has_modes = True
                 self.mode_combo.blockSignals(True)
                 self.mode_combo.clear()
                 for key, display_name in modes:
                     self.mode_combo.addItem(display_name, key)
-                
+
                 current_mode = self.config.get(f"{backend_name}_mode")
                 idx = self.mode_combo.findData(current_mode)
                 if idx >= 0:
                     self.mode_combo.setCurrentIndex(idx)
                 self.mode_combo.blockSignals(False)
-        
+
         self.mode_label.setVisible(has_modes)
         self.mode_combo.setVisible(has_modes)
 
@@ -865,10 +1036,11 @@ class SettingsTabWidget(QWidget):
         while self.backend_params_layout.count():
             item = self.backend_params_layout.takeAt(0)
             widget = item.widget()
-            if widget: widget.deleteLater()
-            
+            if widget:
+                widget.deleteLater()
+
         backend_name = self.config.get('active_backend', 'qwen3')
-        
+
         try:
             backend_class = backends.BACKEND_MAP.get(backend_name)
             if backend_class:
@@ -876,16 +1048,24 @@ class SettingsTabWidget(QWidget):
                     if self.mode_combo.isVisible():
                         mode = self.mode_combo.currentData()
                     else:
-                        mode = self.config.get(f"{backend_name}_mode", "default")
-                        
-                    backend_widget = backend_class.get_settings_widget(mode, self.config, self)
+                        mode = self.config.get(
+                            f"{backend_name}_mode", "default")
+
+                    backend_widget = backend_class.get_settings_widget(
+                        mode, self.config, self,
+                        save_callback=self._debounce_set
+                    )
                     self.backend_params_layout.addWidget(backend_widget)
                 else:
-                    self.backend_params_layout.addWidget(QLabel(f"{backend_name} has no configurable parameters."))
+                    self.backend_params_layout.addWidget(
+                        QLabel(
+                            f"{backend_name} has no configurable parameters."))
             else:
-                self.backend_params_layout.addWidget(QLabel("Backend implementation not found."))
+                self.backend_params_layout.addWidget(
+                    QLabel("Backend implementation not found."))
         except Exception as e:
-            self.backend_params_layout.addWidget(QLabel(f"<span style='color:red'>Error loading UI: {e}</span>"))
+            self.backend_params_layout.addWidget(
+                QLabel(f"<span style='color:red'>Error loading UI: {e}</span>"))
             logger.error(f"Error loading backend settings: {e}")
 
     # ==========================================================
@@ -894,52 +1074,80 @@ class SettingsTabWidget(QWidget):
     def _create_hardware_page(self):
         page = QWidget()
         layout = QFormLayout(page)
-        
+
         dev_row = QHBoxLayout()
         self.qwen3_device_combo = QComboBox()
-        self.qwen3_device_combo.addItems(["cpu", "cuda:0", "cuda:1"])
-        self.qwen3_device_combo.currentTextChanged.connect(lambda t: self.config.set('qwen3_device_map', t))
-        
+        self.qwen3_device_combo.addItem("cpu", "cpu")
+        self.qwen3_device_combo.addItem("cuda:0", "cuda:0")
+        self.qwen3_device_combo.addItem("cuda:1", "cuda:1")
+        self.qwen3_device_combo.currentIndexChanged.connect(
+            lambda i: self._debounce_set(
+                'qwen3_device_map',
+                self.qwen3_device_combo.itemData(i) or "cpu")
+        )
+
         btn_detect = QPushButton("Auto-Detect GPU")
         btn_detect.clicked.connect(self.auto_detect_hardware)
-        
+
         dev_row.addWidget(self.qwen3_device_combo)
         dev_row.addWidget(btn_detect)
         layout.addRow("Compute Device:", dev_row)
 
         self.qwen3_dtype_combo = QComboBox()
         self.qwen3_dtype_combo.addItems(["bfloat16", "float16"])
-        self.qwen3_dtype_combo.currentTextChanged.connect(lambda t: self.config.set('qwen3_dtype', t))
+        self.qwen3_dtype_combo.currentTextChanged.connect(
+            lambda t: self._debounce_set('qwen3_dtype', t))
         layout.addRow("Data Type:", self.qwen3_dtype_combo)
 
         self.chk_flash_attn = QCheckBox("Flash Attention 2")
-        self.chk_flash_attn.setToolTip("Faster, lower VRAM. Requires RTX 30/40 series.")
-        self.chk_flash_attn.toggled.connect(lambda c: self.config.set('qwen3_attn_implementation', "flash_attention_2" if c else "eager"))
+        self.chk_flash_attn.setToolTip(
+            "Faster, lower VRAM. Requires RTX 30/40 series.")
+        self.chk_flash_attn.toggled.connect(
+            lambda c: self._debounce_set(
+                'qwen3_attn_implementation',
+                "flash_attention_2" if c else "eager")
+        )
         layout.addRow(self.chk_flash_attn)
 
         self.qwen3_size_combo = QComboBox()
         self.qwen3_size_combo.addItems(["1.7B", "0.6B"])
-        self.qwen3_size_combo.setCurrentText(self.config.get('qwen3_size', '1.7B'))
-        self.qwen3_size_combo.currentTextChanged.connect(lambda t: self.config.set('qwen3_size', t))
+        self.qwen3_size_combo.setCurrentText(
+            self.config.get('qwen3_size', '1.7B'))
+        self.qwen3_size_combo.currentTextChanged.connect(
+            lambda t: self._debounce_set('qwen3_size', t))
         layout.addRow("Model Size:", self.qwen3_size_combo)
-        
+
         return page
 
     def auto_detect_hardware(self):
+        """Auto-detect GPU hardware. Block signals on the device combo
+        during repopulation to prevent spurious config writes to "cpu"
+        before we settle on the correct CUDA device."""
         try:
             import torch
             if torch.cuda.is_available():
                 count = torch.cuda.device_count()
+                # Block signals while repopulating to avoid writing
+                # intermediate "cpu" state to config
+                self.qwen3_device_combo.blockSignals(True)
                 self.qwen3_device_combo.clear()
-                self.qwen3_device_combo.addItem("cpu")
+                self.qwen3_device_combo.addItem("cpu", "cpu")
                 for i in range(count):
                     name = torch.cuda.get_device_name(i)
-                    self.qwen3_device_combo.addItem(f"cuda:{i} ({name})")
+                    self.qwen3_device_combo.addItem(
+                        f"cuda:{i} ({name})", f"cuda:{i}")
                 self.qwen3_device_combo.setCurrentIndex(1)
-                self.config.set('qwen3_device_map', "cuda:0")
-                QMessageBox.information(self, "Success", f"Found {count} GPU(s).")
+                self.qwen3_device_combo.blockSignals(False)
+
+                # Now explicitly persist the chosen device
+                selected = self.qwen3_device_combo.currentData() or "cuda:0"
+                self._debounce_set('qwen3_device_map', selected)
+
+                QMessageBox.information(
+                    self, "Success", f"Found {count} GPU(s).")
             else:
-                QMessageBox.warning(self, "No GPU", "No CUDA-compatible GPU found.")
+                QMessageBox.warning(
+                    self, "No GPU", "No CUDA-compatible GPU found.")
                 self.qwen3_device_combo.setCurrentText("cpu")
         except ImportError:
             QMessageBox.critical(self, "Error", "PyTorch not installed.")
@@ -950,82 +1158,98 @@ class SettingsTabWidget(QWidget):
     def _create_chunking_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        
+
         info_group = QGroupBox("Long Text Handling")
         info_layout = QVBoxLayout()
         info_label = QLabel(
             "<b>Automatic Text Chunking for TTS</b><br><br>"
-            "When enabled, long text inputs are automatically split into smaller chunks "
-            "that the TTS model can process reliably. Each chunk is generated separately "
-            "and then concatenated to produce the final audio output.<br><br>"
-            "<i>This prevents audio generation failures for long paragraphs and ensures "
-            "consistent voice quality across chunked segments.</i>"
+            "When enabled, long text inputs are automatically split into "
+            "smaller chunks that the TTS model can process reliably. Each "
+            "chunk is generated separately and then concatenated to produce "
+            "the final audio output.<br><br>"
+            "<i>This prevents audio generation failures for long paragraphs "
+            "and ensures consistent voice quality across chunked segments.</i>"
         )
         info_label.setWordWrap(True)
         info_label.setStyleSheet("color: #cccccc; padding: 10px;")
         info_layout.addWidget(info_label)
         info_group.setLayout(info_layout)
         layout.addWidget(info_group)
-        
+
         settings_group = QGroupBox("Chunking Settings")
         form_layout = QFormLayout()
-        
+
         self.chk_enable_chunking = QCheckBox("Enable Automatic Text Chunking")
-        self.chk_enable_chunking.setToolTip("When disabled, long texts may cause TTS failures")
+        self.chk_enable_chunking.setToolTip(
+            "When disabled, long texts may cause TTS failures")
         self.chk_enable_chunking.setChecked(True)
-        self.chk_enable_chunking.toggled.connect(lambda c: self.config.set('enable_text_chunking', c))
+        self.chk_enable_chunking.toggled.connect(
+            lambda c: self._debounce_set('enable_text_chunking', c))
         form_layout.addRow(self.chk_enable_chunking)
-        
+
         self.spin_chunk_max_chars = QSpinBox()
         self.spin_chunk_max_chars.setRange(100, 2000)
         self.spin_chunk_max_chars.setSingleStep(50)
         self.spin_chunk_max_chars.setSuffix(" chars")
-        self.spin_chunk_max_chars.setToolTip("Maximum characters per audio chunk.")
-        self.spin_chunk_max_chars.valueChanged.connect(lambda v: self._debounce_set('chunk_max_chars', v))
+        self.spin_chunk_max_chars.setToolTip(
+            "Maximum characters per audio chunk.")
+        self.spin_chunk_max_chars.valueChanged.connect(
+            lambda v: self._debounce_set('chunk_max_chars', v))
         form_layout.addRow("Max Chars per Chunk:", self.spin_chunk_max_chars)
-        
+
         self.spin_chunk_max_sentences = QSpinBox()
         self.spin_chunk_max_sentences.setRange(1, 10)
-        self.spin_chunk_max_sentences.setToolTip("Maximum sentences per chunk.")
-        self.spin_chunk_max_sentences.valueChanged.connect(lambda v: self._debounce_set('chunk_max_sentences', v))
-        form_layout.addRow("Max Sentences per Chunk:", self.spin_chunk_max_sentences)
-        
+        self.spin_chunk_max_sentences.setToolTip(
+            "Maximum sentences per chunk.")
+        self.spin_chunk_max_sentences.valueChanged.connect(
+            lambda v: self._debounce_set('chunk_max_sentences', v))
+        form_layout.addRow("Max Sentences per Chunk:",
+                           self.spin_chunk_max_sentences)
+
         self.spin_chunk_min_chars = QSpinBox()
         self.spin_chunk_min_chars.setRange(10, 200)
         self.spin_chunk_min_chars.setSingleStep(10)
         self.spin_chunk_min_chars.setSuffix(" chars")
-        self.spin_chunk_min_chars.setToolTip("Minimum characters to form a valid chunk.")
-        self.spin_chunk_min_chars.valueChanged.connect(lambda v: self._debounce_set('chunk_min_chars', v))
+        self.spin_chunk_min_chars.setToolTip(
+            "Minimum characters to form a valid chunk.")
+        self.spin_chunk_min_chars.valueChanged.connect(
+            lambda v: self._debounce_set('chunk_min_chars', v))
         form_layout.addRow("Min Chunk Size:", self.spin_chunk_min_chars)
-        
+
         self.spin_warn_threshold = QSpinBox()
         self.spin_warn_threshold.setRange(500, 5000)
         self.spin_warn_threshold.setSingleStep(100)
         self.spin_warn_threshold.setSuffix(" chars")
-        self.spin_warn_threshold.setToolTip("Log a warning when text exceeds this length")
-        self.spin_warn_threshold.valueChanged.connect(lambda v: self._debounce_set('chunk_warn_threshold', v))
+        self.spin_warn_threshold.setToolTip(
+            "Log a warning when text exceeds this length")
+        self.spin_warn_threshold.valueChanged.connect(
+            lambda v: self._debounce_set('chunk_warn_threshold', v))
         form_layout.addRow("Warning Threshold:", self.spin_warn_threshold)
-        
+
         settings_group.setLayout(form_layout)
         layout.addWidget(settings_group)
-        
+
         impact_group = QGroupBox("Estimated Impact")
         impact_layout = QVBoxLayout()
         impact_label = QLabel(
             "<b>Recommended Settings by Use Case:</b><br><br>"
-            "• <b>Short slides (~200 chars):</b> Chunking rarely needed, defaults work fine<br>"
-            "• <b>Medium slides (~500 chars):</b> Default settings (500 chars/chunk) recommended<br>"
-            "• <b>Long narratives (~1000+ chars):</b> Consider 400-500 chars/chunk for best quality<br>"
-            "• <b>Very long text (~2000+ chars):</b> Reduce to 300-400 chars if quality issues occur<br><br>"
-            "<i>Note: Smaller chunks = more API calls but more reliable output. "
-            "Larger chunks = fewer calls but may hit model limits.</i>"
+            "• <b>Short slides (~200 chars):</b> Chunking rarely needed, "
+            "defaults work fine<br>"
+            "• <b>Medium slides (~500 chars):</b> Default settings "
+            "(500 chars/chunk) recommended<br>"
+            "• <b>Long narratives (~1000+ chars):</b> Consider 400-500 "
+            "chars/chunk for best quality<br>"
+            "• <b>Very long text (~2000+ chars):</b> Reduce to 300-400 "
+            "chars if quality issues occur<br><br>"
+            "<i>Note: Smaller chunks = more API calls but more reliable "
+            "output. Larger chunks = fewer calls but may hit model limits.</i>"
         )
         impact_label.setWordWrap(True)
         impact_label.setStyleSheet("color: #aaaaaa; padding: 10px;")
         impact_layout.addWidget(impact_label)
         impact_group.setLayout(impact_layout)
         layout.addWidget(impact_group)
-        
+
         layout.addStretch()
         return page
 
@@ -1035,17 +1259,18 @@ class SettingsTabWidget(QWidget):
     def _create_paths_page(self):
         page = QWidget()
         layout = QFormLayout(page)
-        
+
         def make_validated_row(label, key, is_dir=True):
             row = QHBoxLayout()
             edit = QLineEdit()
             edit.setText(self.config.get(key, ""))
-            
+
             def check_path():
                 text = edit.text()
-                self.config.set(key, text)
-                
-                exists = os.path.isdir(text) if is_dir else os.path.exists(text)
+                self._debounce_set(key, text)
+
+                exists = (os.path.isdir(text) if is_dir
+                          else os.path.exists(text))
                 p = edit.palette()
                 if exists:
                     p.setColor(QPalette.ColorRole.Base, QColor("#1e2f23"))
@@ -1060,8 +1285,9 @@ class SettingsTabWidget(QWidget):
 
             btn = QPushButton("...")
             btn.setMaximumWidth(30)
-            btn.clicked.connect(lambda: self.browse_generic(edit, is_dir))
-            
+            btn.clicked.connect(
+                lambda: self.browse_generic(edit, is_dir, config_key=key))
+
             row.addWidget(QLabel(label))
             row.addWidget(edit)
             row.addWidget(btn)
@@ -1069,27 +1295,46 @@ class SettingsTabWidget(QWidget):
 
         layout.addRow(make_validated_row("HF Model Cache:", "hf_cache_dir"))
         layout.addRow(make_validated_row("HF Datasets:", "hf_datasets_dir"))
-        layout.addRow(make_validated_row("Voice References:", "voice_references_root"))
-        layout.addRow(make_validated_row("Voice Design Cache:", "instruction_folder_root"))
-        
+        layout.addRow(
+            make_validated_row("Voice References:", "voice_references_root"))
+        layout.addRow(make_validated_row(
+            "Voice Design Cache:", "instruction_folder_root"))
+
         self.chk_symlinks = QCheckBox("Use Symlinks (Linux/Mac only)")
-        self.chk_symlinks.setChecked(self.config.get("hf_use_symlinks", False))
-        self.chk_symlinks.toggled.connect(lambda c: self.config.set("hf_use_symlinks", c))
+        self.chk_symlinks.setChecked(
+            self.config.get("hf_use_symlinks", False))
+        self.chk_symlinks.toggled.connect(
+            lambda c: self._debounce_set("hf_use_symlinks", c))
         layout.addRow(self.chk_symlinks)
-        
+
         return page
 
     def browse_output_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "Select Output Directory", self.out_dir_edit.text())
-        if d: self.out_dir_edit.setText(d)
+        d = QFileDialog.getExistingDirectory(
+            self, "Select Output Directory", self.out_dir_edit.text())
+        if d:
+            self.out_dir_edit.setText(d)
+            # Emit editingFinished so the persisted path is consistent
+            # with the browse_generic pattern
+            self.out_dir_edit.editingFinished.emit()
 
-    def browse_generic(self, line_edit, is_dir):
+    def browse_generic(self, line_edit, is_dir, config_key=None):
+        result = None
         if is_dir:
-            d = QFileDialog.getExistingDirectory(self, "Select Directory", line_edit.text())
-            if d: line_edit.setText(d)
+            result = QFileDialog.getExistingDirectory(
+                self, "Select Directory", line_edit.text())
         else:
-            f, _ = QFileDialog.getOpenFileName(self, "Select File", line_edit.text())
-            if f: line_edit.setText(f)
+            result, _ = QFileDialog.getOpenFileName(
+                self, "Select File", line_edit.text())
+
+        if result:
+            line_edit.setText(result)
+            # setText() does NOT trigger editingFinished, so we must
+            # save explicitly to avoid the "displayed but not persisted" bug.
+            if config_key:
+                self._debounce_set(config_key, result)
+            # Also trigger the editingFinished handlers if any
+            line_edit.editingFinished.emit()
 
     # ==========================================================
     # PAGE: DIAGNOSTICS
@@ -1097,20 +1342,21 @@ class SettingsTabWidget(QWidget):
     def _create_diagnostics_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        
+
         info_text = QTextEdit()
         info_text.setReadOnly(True)
-        
+
         try:
             import torch
-            cuda_ver = torch.version.cuda
-            gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "No GPU"
+            cuda_ver = torch.version.cuda or "N/A"
+            gpu_name = (torch.cuda.get_device_name(0)
+                        if torch.cuda.is_available() else "No GPU")
             torch_ver = torch.__version__
-        except:
+        except ImportError:
             cuda_ver = "N/A"
             gpu_name = "N/A"
             torch_ver = "Not Installed"
-            
+
         report = f"""
     <h3>System Information</h3>
     <b>OS:</b> {platform.system()} {platform.release()}<br>
@@ -1123,10 +1369,11 @@ class SettingsTabWidget(QWidget):
     <b>Cache Dir:</b> {self.config.get('hf_cache_dir')}
         """
         info_text.setHtml(report)
-        
+
         btn_copy = QPushButton("Copy Report to Clipboard")
-        btn_copy.clicked.connect(lambda: QApplication.clipboard().setText(info_text.toPlainText()))
-        
+        btn_copy.clicked.connect(
+            lambda: QApplication.clipboard().setText(info_text.toPlainText()))
+
         layout.addWidget(info_text)
         layout.addWidget(btn_copy)
         return page
@@ -1149,80 +1396,100 @@ class NewProjectTabWidget(QWidget):
 
         self.name_input = QLineEdit()
         self.name_input.setPlaceholderText("My Awesome Video")
-        
+
         self.type_combo = QComboBox()
         self.type_combo.addItems(["Blank Slide", "Text Slide", "Image Slide"])
         self.type_combo.currentIndexChanged.connect(self.on_type_changed)
-        
+
         self.content_input = QLineEdit()
         self.content_input.setPlaceholderText("Enter text or select image...")
-        
+        self.content_input.setEnabled(False)  # Disabled by default for "Blank Slide"
+
         self.btn_browse = QPushButton("...")
         self.btn_browse.setMaximumWidth(40)
         self.btn_browse.clicked.connect(self.browse_content)
-        self.btn_browse.setVisible(False) 
-        
+        self.btn_browse.setVisible(False)
+
         content_layout = QHBoxLayout()
         content_layout.addWidget(self.content_input)
         content_layout.addWidget(self.btn_browse)
 
         self.btn_create = QPushButton("Create New Project")
-        self.btn_create.setStyleSheet("background-color: #28a745; color: white; font-weight: bold; padding: 8px;")
+        self.btn_create.setStyleSheet(
+            "background-color: #28a745; color: white; "
+            "font-weight: bold; padding: 8px;")
         self.btn_create.clicked.connect(self.create_project)
 
         layout.addRow("Project Name:", self.name_input)
         layout.addRow("Initial Slide Type:", self.type_combo)
         layout.addRow("Content:", content_layout)
         layout.addRow(self.btn_create)
-        layout.addRow(QLabel("<i>Note: Project will be created and added to the library.</i>"))
+        layout.addRow(QLabel(
+            "<i>Note: Project will be created and added to the library.</i>"))
 
     def on_type_changed(self, index):
-        if self.type_combo.currentText() == "Image Slide":
+        slide_type = self.type_combo.currentText()
+        if slide_type == "Image Slide":
             self.content_input.setPlaceholderText("Path to image...")
             self.content_input.setEnabled(True)
             self.btn_browse.setVisible(True)
-        elif self.type_combo.currentText() == "Text Slide":
+        elif slide_type == "Text Slide":
             self.content_input.setPlaceholderText("Enter text for slide...")
             self.content_input.setEnabled(True)
             self.btn_browse.setVisible(False)
-        else:
+        else:  # Blank Slide
             self.content_input.clear()
             self.content_input.setEnabled(False)
             self.btn_browse.setVisible(False)
 
     def browse_content(self):
-        f, _ = QFileDialog.getOpenFileName(self, "Select Image", "", "Images (*.png *.jpg *.jpeg)")
+        f, _ = QFileDialog.getOpenFileName(
+            self, "Select Image", "", "Images (*.png *.jpg *.jpeg)")
         if f:
             self.content_input.setText(f)
 
     def create_project(self):
-        name = self.name_input.text().strip()
-        if not name:
-            QMessageBox.warning(self, "Input Error", "Please enter a project name.")
+        raw_name = self.name_input.text().strip()
+        if not raw_name:
+            QMessageBox.warning(
+                self, "Input Error", "Please enter a project name.")
             return
 
-        root_dir = self.config.get('projects_root', os.path.join(os.getcwd(), "Projects"))
+        # Sanitize the name to remove illegal filesystem characters
+        name = _sanitize_project_name(raw_name)
+        if not name:
+            QMessageBox.warning(
+                self, "Input Error",
+                "Project name contains only invalid characters.")
+            return
+
+        root_dir = self.config.get(
+            'projects_root', os.path.join(os.getcwd(), "Projects"))
         if not os.path.exists(root_dir):
             try:
                 os.makedirs(root_dir)
             except OSError as e:
-                QMessageBox.critical(self, "Error", f"Could not create projects directory: {e}")
+                QMessageBox.critical(
+                    self, "Error",
+                    f"Could not create projects directory: {e}")
                 return
 
         project_path = os.path.join(root_dir, name)
         if os.path.exists(project_path):
-            QMessageBox.warning(self, "Exists", f"A project folder named '{name}' already exists.")
+            QMessageBox.warning(
+                self, "Exists",
+                f"A project folder named '{name}' already exists.")
             return
 
         try:
             os.makedirs(project_path)
-            
+
             slide_type = self.type_combo.currentText()
             content = self.content_input.text()
-            
+
             html_path = os.path.join(project_path, "slide1.html")
             txt_path = os.path.join(project_path, "slide1.txt")
-            
+
             if slide_type == "Text Slide":
                 create_slide_file(html_path, get_default_slide_html(content))
                 with open(txt_path, "w", encoding="utf-8") as f:
@@ -1231,31 +1498,43 @@ class NewProjectTabWidget(QWidget):
                 if content and os.path.exists(content):
                     try:
                         from utils import get_image_slide_html
-                        create_slide_file(html_path, get_image_slide_html(content))
+                        create_slide_file(
+                            html_path, get_image_slide_html(content))
                     except ImportError:
-                        create_slide_file(html_path, f"<html><body><img src='file:///{content}'></body></html>")
-                    
+                        create_slide_file(
+                            html_path,
+                            f"<html><body><img src='file:///{content}'></body></html>")
+
                     with open(txt_path, "w", encoding="utf-8") as f:
                         f.write("Image slide.")
                 else:
-                    create_slide_file(html_path, get_blank_slide_html("#000000"))
-                    with open(txt_path, "w", encoding="utf-8") as f: f.write("")
+                    create_slide_file(
+                        html_path, get_blank_slide_html("#000000"))
+                    with open(txt_path, "w", encoding="utf-8") as f:
+                        f.write("")
             elif slide_type == "Blank Slide":
-                create_slide_file(html_path, get_blank_slide_html("#000000"))
-                with open(txt_path, "w", encoding="utf-8") as f: f.write("")
+                create_slide_file(
+                    html_path, get_blank_slide_html("#000000"))
+                with open(txt_path, "w", encoding="utf-8") as f:
+                    f.write("")
 
             if self.on_project_created:
                 self.on_project_created(project_path)
-            
+
             self.name_input.clear()
             self.content_input.clear()
             self.name_input.setFocus()
-            
-            QMessageBox.information(self, "Success", f"Project '{name}' created successfully!")
+            self.type_combo.setCurrentIndex(0)
+
+            QMessageBox.information(
+                self, "Success",
+                f"Project '{name}' created successfully!")
 
         except Exception as e:
             logger.exception("Failed to create project")
-            QMessageBox.critical(self, "Error", f"Failed to create project: {e}")
+            QMessageBox.critical(
+                self, "Error", f"Failed to create project: {e}")
+
 
 # =================================================================
 # SLIDE LIST PANEL (Modular Sub-Component)
@@ -1359,6 +1638,10 @@ class SlideListPanel(QWidget):
         if 0 <= index < self.slide_list.count():
             self.slide_list.setCurrentRow(index)
 
+    def count(self):
+        """Return the total number of slides in the list."""
+        return self.slide_list.count()
+
 
 # =================================================================
 # SLIDE PREVIEW PANEL (Modular Sub-Component)
@@ -1428,9 +1711,9 @@ class SlidePreviewPanel(QWidget):
         self.btn_fit.setToolTip("Scale slide to fit the preview area")
         self.btn_fit.clicked.connect(self.fit_to_screen)
 
-        self.btn_zoom_out = QPushButton("−")
+        self.btn_zoom_out = QPushButton("-")
         self.btn_zoom_out.setFixedSize(28, 28)
-        self.btn_zoom_out.setToolTip("Zoom out (−25%)")
+        self.btn_zoom_out.setToolTip("Zoom out (-25%)")
         self.btn_zoom_out.clicked.connect(lambda: self._step_scale(-25))
 
         self.scale_combo = QComboBox()
@@ -1446,7 +1729,7 @@ class SlidePreviewPanel(QWidget):
         self.btn_zoom_in.setToolTip("Zoom in (+25%)")
         self.btn_zoom_in.clicked.connect(lambda: self._step_scale(25))
 
-        self.lbl_info = QLabel(f"{self.SLIDE_W} × {self.SLIDE_H}")
+        self.lbl_info = QLabel(f"{self.SLIDE_W} x {self.SLIDE_H}")
 
         tb.addWidget(self.btn_fit)
         tb.addStretch()
@@ -1713,7 +1996,7 @@ class SlideEditorTabWidget(QWidget):
         - Debounced auto-save (800 ms after last keystroke)
         - Debounced preview refresh (500 ms after last HTML change)
         - Fit to Screen button with auto-refit on resize
-        - Scale percentage control (combo + / − buttons)
+        - Scale percentage control (combo + / - buttons)
         - Full CSS rendering (Tailwind CDN, Google Fonts, Material Icons)
         - Ctrl+S for immediate save
     """
@@ -1754,6 +2037,17 @@ class SlideEditorTabWidget(QWidget):
         self._save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
         self._save_shortcut.activated.connect(self.save_current_slide)
 
+        # Next/Previous Slide
+        self._shortcut_next_slide = QShortcut(QKeySequence("Ctrl+F"), self)
+        self._shortcut_next_slide.activated.connect(self._next_slide)
+
+        self._shortcut_prev_slide = QShortcut(QKeySequence("Ctrl+G"), self)
+        self._shortcut_prev_slide.activated.connect(self._prev_slide)
+
+        # Add New Slide
+        self._shortcut_add_slide = QShortcut(QKeySequence("Ctrl+Shift+N"), self)
+        self._shortcut_add_slide.activated.connect(self._add_slide)
+
     # ------------------------------------------------------------------
     # UI Setup
     # ------------------------------------------------------------------
@@ -1777,21 +2071,23 @@ class SlideEditorTabWidget(QWidget):
         hdr.setContentsMargins(10, 0, 10, 0)
 
         lbl = QLabel(f"📝 {self.project_name}")
-        lbl.setStyleSheet("color: #ddd; font-weight: bold; font-size: 13px; background: transparent;")
+        lbl.setStyleSheet(
+            "color: #ddd; font-weight: bold; font-size: 13px; "
+            "background: transparent;")
         hdr.addWidget(lbl)
         hdr.addStretch()
 
         self.lbl_dirty = QLabel("✓ Saved")
-        self.lbl_dirty.setStyleSheet("color: #6a9955; font-size: 11px; background: transparent;")
+        self.lbl_dirty.setStyleSheet(
+            "color: #6a9955; font-size: 11px; background: transparent;")
         hdr.addWidget(self.lbl_dirty)
 
         layout.addWidget(header)
 
         # ── Main Splitter ────────────────────────────────────────
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setStyleSheet("""
-            QSplitter::handle { background: #3c3c3c; width: 2px; }
-        """)
+        splitter.setStyleSheet(
+            "QSplitter::handle { background: #3c3c3c; width: 2px; }")
 
         self.list_panel = SlideListPanel()
         self.list_panel.setMinimumWidth(130)
@@ -1895,10 +2191,12 @@ class SlideEditorTabWidget(QWidget):
     def _update_dirty_indicator(self):
         if self._dirty:
             self.lbl_dirty.setText("● Unsaved")
-            self.lbl_dirty.setStyleSheet("color: #f1c40f; font-size: 11px; background: transparent;")
+            self.lbl_dirty.setStyleSheet(
+                "color: #f1c40f; font-size: 11px; background: transparent;")
         else:
             self.lbl_dirty.setText("✓ Saved")
-            self.lbl_dirty.setStyleSheet("color: #6a9955; font-size: 11px; background: transparent;")
+            self.lbl_dirty.setStyleSheet(
+                "color: #6a9955; font-size: 11px; background: transparent;")
 
     def _on_auto_save_timeout(self):
         if self._dirty:
@@ -1955,6 +2253,18 @@ class SlideEditorTabWidget(QWidget):
     # Slide Management
     # ------------------------------------------------------------------
 
+    def _next_slide(self):
+        """Navigate to the next slide in the list."""
+        idx = self.list_panel.current_index()
+        if 0 <= idx < len(self.slide_files) - 1:
+            self.list_panel.set_current_index(idx + 1)
+
+    def _prev_slide(self):
+        """Navigate to the previous slide in the list."""
+        idx = self.list_panel.current_index()
+        if idx > 0:
+            self.list_panel.set_current_index(idx - 1)
+
     def _add_slide(self):
         next_num = len(self.slide_files) + 1
 
@@ -1978,14 +2288,16 @@ class SlideEditorTabWidget(QWidget):
                 f.write("")
             self._load_project()
             if html_path in self.slide_files:
-                self.list_panel.set_current_index(self.slide_files.index(html_path))
+                self.list_panel.set_current_index(
+                    self.slide_files.index(html_path))
         except Exception as e:
             logger.error(f"Failed to add slide: {e}")
 
     def _remove_slide(self):
         if len(self.slide_files) <= 1:
-            QMessageBox.information(self, "Cannot Remove",
-                                    "Project must have at least one slide.")
+            QMessageBox.information(
+                self, "Cannot Remove",
+                "Project must have at least one slide.")
             return
 
         idx = self.list_panel.current_index()
@@ -2044,7 +2356,8 @@ class SlideEditorTabWidget(QWidget):
                     f.write("")
             self._load_project()
             if dst_html in self.slide_files:
-                self.list_panel.set_current_index(self.slide_files.index(dst_html))
+                self.list_panel.set_current_index(
+                    self.slide_files.index(dst_html))
         except Exception as e:
             logger.error(f"Failed to duplicate slide: {e}")
 
@@ -2061,27 +2374,67 @@ class SlideEditorTabWidget(QWidget):
         self._swap_slide_content(idx, idx + 1)
 
     def _swap_slide_content(self, a, b):
-        """Swap the file contents of two slides (preserves filename order)."""
+        """Swap the file contents of two slides (preserves filename order).
+
+        Swaps HTML, text (.txt), AND audio (.wav) files so that
+        reordering slides keeps narration in sync with visuals.
+        """
         ha = self.slide_files[a]
         hb = self.slide_files[b]
         ta = os.path.splitext(ha)[0] + ".txt"
         tb = os.path.splitext(hb)[0] + ".txt"
+        wa = os.path.splitext(ha)[0] + ".wav"
+        wb = os.path.splitext(hb)[0] + ".wav"
 
         try:
-            # Swap HTML
-            with open(ha, 'r', encoding='utf-8') as f: ca = f.read()
-            with open(hb, 'r', encoding='utf-8') as f: cb = f.read()
-            with open(ha, 'w', encoding='utf-8') as f: f.write(cb)
-            with open(hb, 'w', encoding='utf-8') as f: f.write(ca)
+            # ── Swap HTML ──
+            with open(ha, 'r', encoding='utf-8') as f:
+                ca = f.read()
+            with open(hb, 'r', encoding='utf-8') as f:
+                cb = f.read()
+            with open(ha, 'w', encoding='utf-8') as f:
+                f.write(cb)
+            with open(hb, 'w', encoding='utf-8') as f:
+                f.write(ca)
 
-            # Swap text
-            tca, tcb = "", ""
+            # ── Swap text ──
+            tca = ""
+            tcb = ""
             if os.path.exists(ta):
-                with open(ta, 'r', encoding='utf-8') as f: tca = f.read()
+                with open(ta, 'r', encoding='utf-8') as f:
+                    tca = f.read()
             if os.path.exists(tb):
-                with open(tb, 'r', encoding='utf-8') as f: tcb = f.read()
-            with open(ta, 'w', encoding='utf-8') as f: f.write(tcb)
-            with open(tb, 'w', encoding='utf-8') as f: f.write(tca)
+                with open(tb, 'r', encoding='utf-8') as f:
+                    tcb = f.read()
+            with open(ta, 'w', encoding='utf-8') as f:
+                f.write(tcb)
+            with open(tb, 'w', encoding='utf-8') as f:
+                f.write(tca)
+
+            # ── Swap audio (.wav) ──
+            wca = None
+            wcb = None
+            if os.path.exists(wa):
+                with open(wa, 'rb') as f:
+                    wca = f.read()
+            if os.path.exists(wb):
+                with open(wb, 'rb') as f:
+                    wcb = f.read()
+            if wca is not None and wcb is not None:
+                with open(wa, 'wb') as f:
+                    f.write(wcb)
+                with open(wb, 'wb') as f:
+                    f.write(wca)
+            elif wca is not None:
+                # Only slide A had audio: move it to B, delete A's
+                with open(wb, 'wb') as f:
+                    f.write(wca)
+                os.remove(wa)
+            elif wcb is not None:
+                # Only slide B had audio: move it to A, delete B's
+                with open(wa, 'wb') as f:
+                    f.write(wcb)
+                os.remove(wb)
 
             self._load_project()
             self.list_panel.set_current_index(b)

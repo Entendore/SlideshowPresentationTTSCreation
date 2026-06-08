@@ -4,6 +4,8 @@ from typing import List, Tuple, Optional, Callable
 import os
 import tempfile
 from utils import logger
+from text_chunker import TextChunker, ChunkingConfig
+
 
 class BaseTTSBackend(ABC):
     """
@@ -12,6 +14,10 @@ class BaseTTSBackend(ABC):
     All backend plugins (Qwen3, Bark, Tortoise, etc.) must inherit from this class
     and implement the defined methods to be compatible with the rendering engine.
     """
+
+    DESCRIPTION: str = "Generic backend implementation."
+
+    AUDIO_SETTINGS_KEYS: list = []
     
     def __init__(self, config: dict):
         """
@@ -147,7 +153,7 @@ class BaseTTSBackend(ABC):
         output_path: str,
         slide_index: int,
         language: str,
-        chunker: Optional['TextChunker'],
+        chunker: Optional[TextChunker],
         generate_single_fn: Callable[[str, str], bool],
         concatenate_fn: Callable[[List[str], str], bool],
         temp_dir: str,

@@ -2,16 +2,66 @@
 from .base import BaseTTSBackend
 from .qwen3 import Qwen3Backend
 from .edge import EdgeTTSBackend
+from .omnivoice import OmniVoiceBackend
 
 # Map of string names to classes
 # Used by the UI to populate dropdowns and the engine to instantiate workers.
 BACKEND_MAP = {
     "qwen3": Qwen3Backend,
     "edge": EdgeTTSBackend,
-    # Future backends can be added here, e.g.:
-    # "bark": BarkBackend,
-    # "tortoise": TortoiseBackend,
+    "omnivoice": OmniVoiceBackend,
 }
+
+
+def get_backend_descriptions() -> dict:
+    """
+    Build a description dictionary from all registered backends.
+
+    Returns:
+        dict: Mapping of backend_name -> description string.
+              Always includes a "default" key as fallback.
+    """
+    descriptions = {"default": BaseTTSBackend.DESCRIPTION}
+    for name, cls in BACKEND_MAP.items():
+        descriptions[name] = getattr(cls, "DESCRIPTION", BaseTTSBackend.DESCRIPTION)
+    return descriptions
+
+# Keys that are not owned by any single backend but still affect
+# whether cached audio should be considered stale.
+_GLOBAL_AUDIO_SETTINGS_KEYS = [
+    "active_backend",
+]
+
+def get_all_audio_settings_keys() -> list:
+    """
+    Collect every config key that can invalidate cached audio.
+
+    Combines:
+      - Global keys (e.g. "active_backend")
+      - Per-backend keys declared in each backend's AUDIO_SETTINGS_KEYS
+
+    Duplicates are removed while preserving order.
+
+    Returns:
+        list[str]: Deduplicated list of config key names.
+    """
+    seen = set()
+    result = []
+
+    # Global keys first
+    for key in _GLOBAL_AUDIO_SETTINGS_KEYS:
+        if key not in seen:
+            seen.add(key)
+            result.append(key)
+
+    # Per-backend keys
+    for name, cls in BACKEND_MAP.items():
+        for key in getattr(cls, "AUDIO_SETTINGS_KEYS", []):
+            if key not in seen:
+                seen.add(key)
+                result.append(key)
+
+    return result
 
 def get_backend(backend_name: str, config: dict) -> BaseTTSBackend:
     """
