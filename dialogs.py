@@ -20,15 +20,17 @@ from PySide6.QtWidgets import (
     QPlainTextEdit, QStackedWidget, QListWidget, QListWidgetItem, QScrollArea,
     QInputDialog
 )
-from PySide6.QtCore import Qt, QTimer, QMetaObject, QSize, QUrl, Signal
+from PySide6.QtCore import Qt, QTimer, QMetaObject, QSize, QUrl, Signal, QTimer, QSize, QUrl
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtGui import QShortcut, QKeySequence, QFont, QColor, QPalette
 
 # Local imports
 from utils import (
     logger, get_theme, natural_sort_key,
-    create_slide_file, get_default_slide_html, get_blank_slide_html
+    create_slide_file, get_default_slide_html, get_blank_slide_html, is_image_slide, get_image_slide_html,
+    import_pdf_append, import_image_as_slide, get_next_slide_number, import_pdf_as_project, get_pdf_aspect_ratio
 )
+
 from config import AppConfig
 import backends
 
@@ -695,6 +697,9 @@ class SettingsTabWidget(QWidget):
         self.config.settings[key] = value
         self._settings_timer.start()  # restart the debounce window
         self.settings_changed.emit(key, value)
+        
+        if key in ('width', 'height'):
+            self._push_resolution_to_editors()
 
     def _flush_pending_settings(self):
         """Write all pending settings to config (and disk)."""
@@ -708,6 +713,37 @@ class SettingsTabWidget(QWidget):
     # ==========================================================
     # RESOLUTION HELPERS
     # ==========================================================
+
+    def _push_resolution_to_editors(self):
+        """Find all open SlideEditorTabWidget instances and update their
+        preview panels with the new resolution from settings."""
+        try:
+            # Walk up to find the MainWindow
+            parent = self.parent()
+            main_window = None
+            while parent:
+                if hasattr(parent, 'tabs'):  # MainWindow has self.tabs
+                    main_window = parent
+                    break
+                parent = parent.parent()
+            
+            if not main_window:
+                return
+            
+            # Get current resolution from config
+            width = self.config.get('width', 1280)
+            height = self.config.get('height', 720)
+            
+            # Find all open editor tabs
+            for i in range(main_window.tabs.count()):
+                widget = main_window.tabs.widget(i)
+                if isinstance(widget, SlideEditorTabWidget):
+                    # Update the preview panel inside the editor
+                    if hasattr(widget, 'preview_panel') and hasattr(widget.preview_panel, 'update_preview_resolution'):
+                        widget.preview_panel.update_preview_resolution(width, height)
+        except Exception as e:
+            logger.error(f"Error pushing resolution to editors: {e}")
+
     def _apply_resolution_to_config(self):
         """Read current combo values and write width/height to config."""
         data = self.resolution_combo.currentData()
@@ -781,43 +817,60 @@ class SettingsTabWidget(QWidget):
             item.setHidden(search not in item.text().lower())
 
     def refresh_ui_values(self):
-        """Reloads UI from config."""
-        # General — Resolution
-        self._sync_resolution_combos()
-        self.fps_spin.setValue(self.config.get('fps', 30))
-        self.enc_combo.setCurrentText(self.config.get('encoder', 'auto'))
-        self.worker_spin.setValue(self.config.get('render_workers', 3))
-        self.out_dir_edit.setText(self.config.get('output_dir', 'Output'))
-        self.proj_root_edit.setText(self.config.get('projects_root', 'Projects'))
-        self.trans_spin.setValue(self.config.get('transition_duration', 0.5))
+        """Reloads UI from config. Blocks signals to prevent cascading saves."""
+        # Block signals while programmatically updating widgets
+        self.resolution_combo.blockSignals(True)
+        self.orientation_combo.blockSignals(True)
+        self.fps_spin.blockSignals(True)
+        self.enc_combo.blockSignals(True)
+        self.worker_spin.blockSignals(True)
+        self.trans_spin.blockSignals(True)
+        
+        try:
+            # General — Resolution
+            self._sync_resolution_combos()
+            self.fps_spin.setValue(self.config.get('fps', 30))
+            self.enc_combo.setCurrentText(self.config.get('encoder', 'auto'))
+            self.worker_spin.setValue(self.config.get('render_workers', 3))
+            self.out_dir_edit.setText(self.config.get('output_dir', 'Output'))
+            self.proj_root_edit.setText(self.config.get('projects_root', 'Projects'))
+            self.trans_spin.setValue(self.config.get('transition_duration', 0.5))
 
-        # Backend Settings
-        current_backend = self.config.get('active_backend', 'qwen3')
-        index = self.backend_combo.findData(current_backend)
-        if index >= 0:
-            self.backend_combo.setCurrentIndex(index)
+            # Backend Settings
+            current_backend = self.config.get('active_backend', 'qwen3')
+            index = self.backend_combo.findData(current_backend)
+            if index >= 0:
+                self.backend_combo.setCurrentIndex(index)
 
-        # Hardware — fixed fallback to match config default
-        self.qwen3_device_combo.setCurrentText(
-            self.config.get('qwen3_device_map', 'cuda:0'))
-        self.qwen3_dtype_combo.setCurrentText(
-            self.config.get('qwen3_dtype', 'float16'))
-        self.chk_flash_attn.setChecked(
-            self.config.get('qwen3_attn_implementation') == "flash_attention_2")
-        self.qwen3_size_combo.setCurrentText(
-            self.config.get('qwen3_size', '1.7B'))
+            # Hardware
+            self.qwen3_device_combo.setCurrentText(
+                self.config.get('qwen3_device_map', 'cuda:0'))
+            self.qwen3_dtype_combo.setCurrentText(
+                self.config.get('qwen3_dtype', 'float16'))
+            self.chk_flash_attn.setChecked(
+                self.config.get('qwen3_attn_implementation') == "flash_attention_2")
+            self.qwen3_size_combo.setCurrentText(
+                self.config.get('qwen3_size', '1.7B'))
 
-        # Text Chunking
-        self.chk_enable_chunking.setChecked(
-            self.config.get('enable_text_chunking', True))
-        self.spin_chunk_max_chars.setValue(
-            self.config.get('chunk_max_chars', 500))
-        self.spin_chunk_max_sentences.setValue(
-            self.config.get('chunk_max_sentences', 5))
-        self.spin_chunk_min_chars.setValue(
-            self.config.get('chunk_min_chars', 50))
-        self.spin_warn_threshold.setValue(
-            self.config.get('chunk_warn_threshold', 1000))
+            # Text Chunking
+            self.chk_enable_chunking.setChecked(
+                self.config.get('enable_text_chunking', True))
+            self.spin_chunk_max_chars.setValue(
+                self.config.get('chunk_max_chars', 500))
+            self.spin_chunk_max_sentences.setValue(
+                self.config.get('chunk_max_sentences', 5))
+            self.spin_chunk_min_chars.setValue(
+                self.config.get('chunk_min_chars', 50))
+            self.spin_warn_threshold.setValue(
+                self.config.get('chunk_warn_threshold', 1000))
+        finally:
+            # Always unblock signals
+            self.resolution_combo.blockSignals(False)
+            self.orientation_combo.blockSignals(False)
+            self.fps_spin.blockSignals(False)
+            self.enc_combo.blockSignals(False)
+            self.worker_spin.blockSignals(False)
+            self.trans_spin.blockSignals(False)
 
     # ==========================================================
     # PAGE: GENERAL & VIDEO
@@ -855,6 +908,34 @@ class SettingsTabWidget(QWidget):
         res_layout.addWidget(self.orientation_combo, stretch=2)
         layout.addRow("Resolution:", res_layout)
         layout.addRow("", self.resolution_preview)
+
+        # ── Visual Aspect Ratio Preview Widget ──
+        self.aspect_preview_widget = QWidget()
+        self.aspect_preview_widget.setFixedHeight(60)
+        self.aspect_preview_widget.setStyleSheet("background: transparent;")
+        
+        aspect_layout = QHBoxLayout(self.aspect_preview_widget)
+        aspect_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.aspect_box = QFrame()
+        self.aspect_box.setStyleSheet(
+            "background-color: #0078d4; border-radius: 4px;"
+        )
+        self.aspect_label = QLabel("16:9")
+        self.aspect_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.aspect_label.setStyleSheet(
+            "color: white; font-weight: bold; font-size: 12px; background: transparent;"
+        )
+        
+        aspect_layout.addStretch()
+        aspect_layout.addWidget(self.aspect_box, stretch=0)  # Box scales to represent ratio
+        aspect_layout.addWidget(self.aspect_label, stretch=0)
+        aspect_layout.addStretch()
+        
+        layout.addRow("Aspect Ratio:", self.aspect_preview_widget)
+        
+        # Initial update
+        self._update_aspect_preview()
 
         self.fps_spin = QSpinBox()
         self.fps_spin.setRange(10, 60)
@@ -1031,6 +1112,56 @@ class SettingsTabWidget(QWidget):
         self.mode_combo.setVisible(has_modes)
 
         self.load_backend_widget()
+
+    def _update_aspect_preview(self):
+        """Update the visual aspect ratio box and label."""
+        data = self.resolution_combo.currentData()
+        orientation = self.orientation_combo.currentData()
+        
+        if not data:
+            return
+            
+        base_w, base_h = data
+        if orientation == "portrait":
+            w, h = base_h, base_w
+        else:
+            w, h = base_w, base_h
+        
+        # Calculate greatest common divisor for the ratio label (e.g., 16:9)
+        import math
+        gcd = math.gcd(w, h)
+        ratio_w = w // gcd
+        ratio_h = h // gcd
+        
+        self.aspect_label.setText(f"{ratio_w}:{ratio_h}")
+        
+        # Scale the box to fit the preview area (max 80px wide, 45px tall)
+        max_w_px = 80
+        max_h_px = 45
+        
+        scale_w = max_w_px / w if w > 0 else 1
+        scale_h = max_h_px / h if h > 0 else 1
+        scale = min(scale_w, scale_h)
+        
+        box_w = int(w * scale)
+        box_h = int(h * scale)
+        
+        self.aspect_box.setFixedSize(box_w, box_h)
+
+    def _apply_resolution_to_config(self):
+        """Read current combo values and write width/height to config."""
+        data = self.resolution_combo.currentData()
+        orientation = self.orientation_combo.currentData()
+        if data:
+            base_w, base_h = data
+            if orientation == "portrait":
+                w, h = base_h, base_w
+            else:
+                w, h = base_w, base_h
+            self._debounce_set('width', w)
+            self._debounce_set('height', h)
+        self._update_resolution_preview()
+        self._update_aspect_preview()  # <-- ADD THIS LINE
 
     def load_backend_widget(self):
         while self.backend_params_layout.count():
@@ -1426,6 +1557,106 @@ class NewProjectTabWidget(QWidget):
         layout.addRow(self.btn_create)
         layout.addRow(QLabel(
             "<i>Note: Project will be created and added to the library.</i>"))
+        
+        self.chk_from_pdf = QCheckBox("Create from PDF (each page = 1 slide)")
+        self.chk_from_pdf.toggled.connect(self.on_from_pdf_toggled)
+        # Add to your form layout
+        
+        self.pdf_path_edit = QLineEdit()
+        self.pdf_path_edit.setPlaceholderText("Select a PDF file...")
+        self.pdf_path_edit.setEnabled(False)
+        
+        self.btn_browse_pdf = QPushButton("Browse...")
+        self.btn_browse_pdf.setEnabled(False)
+        self.btn_browse_pdf.clicked.connect(self.browse_pdf)
+        
+        pdf_row = QHBoxLayout()
+        pdf_row.addWidget(self.pdf_path_edit)
+        pdf_row.addWidget(self.btn_browse_pdf)
+
+        layout.addRow(self.chk_from_pdf)
+        layout.addRow("PDF File:", pdf_row)
+
+        # Add to form layout:
+        # form_layout.addRow(self.chk_from_pdf)
+        # form_layout.addRow("PDF File:", pdf_row)
+
+    def _auto_adjust_orientation_for_pdf(self, pdf_path: str):
+        """Automatically switch the video orientation to match the PDF."""
+        pdf_w, pdf_h = get_pdf_aspect_ratio(pdf_path)
+        if pdf_w <= 0 or pdf_h <= 0:
+            return
+        
+        config_dict = (
+            self.config.settings
+            if hasattr(self.config, 'settings')
+            else self.config
+        )
+        vid_w = config_dict.get('width', 1280)
+        vid_h = config_dict.get('height', 720)
+        
+        pdf_is_landscape = pdf_w > pdf_h
+        vid_is_landscape = vid_w > vid_h
+        
+        if pdf_is_landscape != vid_is_landscape:
+            # Orientation mismatch - offer to fix it
+            pdf_orientation = "Landscape (Horizontal)" if pdf_is_landscape else "Portrait (Vertical)"
+            
+            reply = QMessageBox.question(
+                self, "Auto-Adjust Orientation?",
+                f"Your PDF is <b>{pdf_orientation}</b>, but your video is set to "
+                f"<b>{vid_w}x{vid_h}</b>.<br><br>"
+                f"Would you like to automatically switch the video orientation to match?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                # Swap width and height in config
+                new_w = vid_h
+                new_h = vid_w
+                
+                config_dict['width'] = new_w
+                config_dict['height'] = new_h
+                
+                # Save to settings
+                if hasattr(self.config, 'set'):
+                    self.config.set('width', new_w)
+                    self.config.set('height', new_h)
+                
+                logger.info(f"[PDF Import] Auto-adjusted video orientation to {new_w}x{new_h}")
+                
+                # ── Push the new resolution to the open Settings Tab and Preview Panel ──
+                parent = self.parent()
+                while parent:
+                    if hasattr(parent, 'tabs'):  # Found MainWindow
+                        for i in range(parent.tabs.count()):
+                            widget = parent.tabs.widget(i)
+                            
+                            # Update Settings Tab UI
+                            if isinstance(widget, SettingsTabWidget):
+                                if hasattr(widget, 'refresh_ui_values'):
+                                    widget.refresh_ui_values()
+                            
+                            # Update Slide Editor Preview Panel
+                            if isinstance(widget, SlideEditorTabWidget):
+                                if hasattr(widget, 'preview_panel') and hasattr(widget.preview_panel, 'update_preview_resolution'):
+                                    widget.preview_panel.update_preview_resolution(new_w, new_h)
+                        
+                        break
+                    parent = parent.parent()
+
+    def on_from_pdf_toggled(self, checked):
+        self.pdf_path_edit.setEnabled(checked)
+        self.btn_browse_pdf.setEnabled(checked)
+
+    def browse_pdf(self):
+        pdf_path, _ = QFileDialog.getOpenFileName(
+            self, "Select PDF", "",
+            "PDF Files (*.pdf);;All Files (*)"
+        )
+        if pdf_path:
+            self.pdf_path_edit.setText(pdf_path)
 
     def on_type_changed(self, index):
         slide_type = self.type_combo.currentText()
@@ -1449,15 +1680,17 @@ class NewProjectTabWidget(QWidget):
             self.content_input.setText(f)
 
     def create_project(self):
-        raw_name = self.name_input.text().strip()
-        if not raw_name:
-            QMessageBox.warning(
-                self, "Input Error", "Please enter a project name.")
+        """Create a new project with support for PDF import and
+        override/append when a project folder already exists."""
+        project_name = self.name_input.text().strip()
+        project_name = _sanitize_project_name(project_name)
+        if not project_name:
+            QMessageBox.warning(self, "Error", "Please enter a project name.")
             return
 
-        # Sanitize the name to remove illegal filesystem characters
-        name = _sanitize_project_name(raw_name)
-        if not name:
+        # Double-check after sanitization
+        project_name = _sanitize_project_name(project_name)
+        if not project_name:
             QMessageBox.warning(
                 self, "Input Error",
                 "Project name contains only invalid characters.")
@@ -1474,44 +1707,267 @@ class NewProjectTabWidget(QWidget):
                     f"Could not create projects directory: {e}")
                 return
 
-        project_path = os.path.join(root_dir, name)
+        project_path = os.path.join(root_dir, project_name)
+        pdf_import_requested = (
+            self.chk_from_pdf.isChecked()
+            and self.pdf_path_edit.text().strip()
+        )
+
+        # ══════════════════════════════════════════════════════════
+        # HANDLE EXISTING PROJECT DIRECTORY
+        # ══════════════════════════════════════════════════════════
         if os.path.exists(project_path):
-            QMessageBox.warning(
-                self, "Exists",
-                f"A project folder named '{name}' already exists.")
+            # Build a message showing what's in the existing folder
+            existing_items = []
+            try:
+                for item in os.listdir(project_path):
+                    existing_items.append(item)
+            except OSError:
+                existing_items = ["(unable to read directory)"]
+
+            has_slides = any(
+                item.startswith("slide") and item.endswith(".html")
+                for item in existing_items
+            )
+            has_audio = any(
+                item.endswith(".wav") for item in existing_items
+            )
+            has_images = any(
+                item == "images" for item in existing_items
+            )
+            has_manifest = "manifest.json" in existing_items
+
+            # Describe existing content
+            parts = []
+            if has_slides:
+                slide_count = sum(
+                    1 for i in existing_items
+                    if i.startswith("slide") and i.endswith(".html")
+                )
+                parts.append(f"  • {slide_count} slide(s)")
+            if has_audio:
+                wav_count = sum(
+                    1 for i in existing_items if i.endswith(".wav")
+                )
+                parts.append(f"  • {wav_count} audio file(s)")
+            if has_images:
+                parts.append("  • Images folder")
+            if has_manifest:
+                parts.append("  • Manifest (render history)")
+
+            content_summary = "\n".join(parts) if parts else "  (empty folder)"
+
+            # Offer choices
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Project Already Exists")
+            msg.setText(
+                f"A project folder '{project_name}' already exists.\n\n"
+                f"Contents:\n{content_summary}\n\n"
+                f"What would you like to do?"
+            )
+
+            btn_clean = msg.addButton(
+                "🔄 Clean Override\n(delete everything, start fresh)",
+                QMessageBox.ButtonRole.AcceptRole
+            )
+            btn_append = msg.addButton(
+                "➕ Append\n(add new slides to existing project)",
+                QMessageBox.ButtonRole.ActionRole
+            )
+            btn_cancel = msg.addButton(
+                "Cancel",
+                QMessageBox.ButtonRole.RejectRole
+            )
+
+            msg.setDefaultButton(btn_cancel)
+            msg.exec()
+
+            clicked = msg.clickedButton()
+
+            if clicked == btn_cancel:
+                return
+
+            elif clicked == btn_clean:
+                # ── CLEAN OVERRIDE: Remove everything ──
+                confirm = QMessageBox.question(
+                    self, "Confirm Clean Override",
+                    f"This will permanently DELETE all contents of:\n"
+                    f"{project_path}\n\n"
+                    f"Including slides, audio files, images, and render history.\n\n"
+                    f"Are you sure?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No
+                )
+                if confirm != QMessageBox.StandardButton.Yes:
+                    return
+
+                try:
+                    shutil.rmtree(project_path)
+                    logger.info(f"[NewProject] Cleaned existing project: {project_path}")
+                except Exception as e:
+                    QMessageBox.critical(
+                        self, "Error",
+                        f"Could not remove existing project: {e}")
+                    return
+
+            elif clicked == btn_append:
+                # ── APPEND: Keep existing, just add new slides ──
+                # Nothing to delete, we'll add slides after the existing ones
+                pass
+
+        # ══════════════════════════════════════════════════════════
+        # CREATE PROJECT DIRECTORY (if it doesn't exist)
+        # ══════════════════════════════════════════════════════════
+        try:
+            os.makedirs(project_path, exist_ok=True)
+        except OSError as e:
+            QMessageBox.critical(
+                self, "Error",
+                f"Could not create project directory: {e}")
             return
 
-        try:
-            os.makedirs(project_path)
+        # ══════════════════════════════════════════════════════════
+        # PDF IMPORT (creates slides from PDF pages)
+        # ══════════════════════════════════════════════════════════
+        if pdf_import_requested:
+            pdf_path = self.pdf_path_edit.text().strip()
+            self._auto_adjust_orientation_for_pdf(pdf_path)
+            if os.path.exists(pdf_path):
+                try:
+                    import fitz  # Check early
+                except ImportError:
+                    QMessageBox.critical(
+                        self, "Missing Dependency",
+                        "PyMuPDF is required for PDF import.\n\n"
+                        "Install via: pip install PyMuPDF"
+                    )
+                    return
 
+                try:
+                    config_dict = (
+                        self.config.settings
+                        if hasattr(self.config, 'settings')
+                        else self.config
+                    )
+
+                    # Check if this is a fresh project or append
+                    import glob as _glob
+                    existing_html = _glob.glob(
+                        os.path.join(project_path, "slide*.html"))
+
+                    if existing_html:
+                        # Append mode: add PDF pages after existing slides
+                        count = import_pdf_append(
+                            pdf_path, project_path, config_dict)
+                    else:
+                        # Fresh project: PDF pages become the slides
+                        count = import_pdf_as_project(
+                            pdf_path, project_path, config_dict)
+
+                    logger.info(
+                        f"[NewProject] Imported {count} slides from PDF "
+                        f"into '{project_name}'")
+
+                    # Success — notify and clean up UI
+                    if self.on_project_created:
+                        self.on_project_created(project_path)
+
+                    def _do_refresh():
+                        parent = self.parent()
+                        while parent:
+                            if hasattr(parent, 'tabs'):
+                                for i in range(parent.tabs.count()):
+                                    w = parent.tabs.widget(i)
+                                    if (isinstance(w, SlideEditorTabWidget) and 
+                                            w.project_path == project_path):
+                                        w.refresh_from_disk()
+                                        break
+                            parent = parent.parent()
+                    QTimer.singleShot(200, _do_refresh)
+
+                    self.name_input.clear()
+                    self.content_input.clear()
+                    self.name_input.setFocus()
+                    self.type_combo.setCurrentIndex(0)
+
+                    QMessageBox.information(
+                        self, "PDF Imported",
+                        f"Project '{project_name}' created with "
+                        f"{count} slide(s) from PDF.")
+
+                    return  # Done — skip default slide creation
+
+                except Exception as e:
+                    logger.exception("PDF import failed")
+                    QMessageBox.critical(
+                        self, "Import Error",
+                        f"PDF import failed:\n{e}\n\n"
+                        f"A default slide will be created instead.")
+                    # Fall through to create a default slide
+
+        # ══════════════════════════════════════════════════════════
+        # DEFAULT SLIDE CREATION (no PDF, or PDF failed)
+        # ══════════════════════════════════════════════════════════
+        try:
             slide_type = self.type_combo.currentText()
             content = self.content_input.text()
 
-            html_path = os.path.join(project_path, "slide1.html")
-            txt_path = os.path.join(project_path, "slide1.txt")
+            # Find next available slide number (for append support)
+            import glob as _glob
+            existing = _glob.glob(
+                os.path.join(project_path, "slide*.html"))
+            if existing:
+                slide_num = get_next_slide_number(project_path)
+            else:
+                slide_num = 1
+
+            html_path = os.path.join(
+                project_path, f"slide{slide_num}.html")
+            txt_path = os.path.join(
+                project_path, f"slide{slide_num}.txt")
 
             if slide_type == "Text Slide":
-                create_slide_file(html_path, get_default_slide_html(content))
+                create_slide_file(
+                    html_path, get_default_slide_html(content))
                 with open(txt_path, "w", encoding="utf-8") as f:
                     f.write(content)
+
             elif slide_type == "Image Slide":
                 if content and os.path.exists(content):
                     try:
-                        from utils import get_image_slide_html
+                        # Copy image to project and create proper slide
+                        images_dir = os.path.join(project_path, "images")
+                        os.makedirs(images_dir, exist_ok=True)
+                        
+                        ext = os.path.splitext(content)[1].lower()
+                        if ext not in ('.png', '.jpg', '.jpeg', '.gif',
+                                       '.bmp', '.webp', '.tiff'):
+                            ext = '.png'
+                        
+                        image_filename = f"slide_{slide_num}{ext}"
+                        dest = os.path.join(images_dir, image_filename)
+                        shutil.copy2(content, dest)
+                        
+                        # Use relative path in HTML
+                        image_relative = f"images/{image_filename}"
                         create_slide_file(
-                            html_path, get_image_slide_html(content))
+                            html_path,
+                            get_image_slide_html(image_relative, project_path))
                     except ImportError:
                         create_slide_file(
                             html_path,
-                            f"<html><body><img src='file:///{content}'></body></html>")
+                            f"<html><body>"
+                            f"<img src='file:///{content}'>"
+                            f"</body></html>")
 
                     with open(txt_path, "w", encoding="utf-8") as f:
-                        f.write("Image slide.")
+                        f.write("")  # Silent by default for image slides
                 else:
                     create_slide_file(
                         html_path, get_blank_slide_html("#000000"))
                     with open(txt_path, "w", encoding="utf-8") as f:
                         f.write("")
+
             elif slide_type == "Blank Slide":
                 create_slide_file(
                     html_path, get_blank_slide_html("#000000"))
@@ -1528,7 +1984,7 @@ class NewProjectTabWidget(QWidget):
 
             QMessageBox.information(
                 self, "Success",
-                f"Project '{name}' created successfully!")
+                f"Project '{project_name}' created successfully!")
 
         except Exception as e:
             logger.exception("Failed to create project")
@@ -1660,8 +2116,9 @@ class SlidePreviewPanel(QWidget):
     SLIDE_H = 720
     PRESET_SCALES = ["Fit", "25%", "50%", "75%", "100%", "125%", "150%", "200%"]
 
-    def __init__(self, parent=None):
+    def __init__(self, config, parent=None):
         super().__init__(parent)
+        self.config = config
         self._scale_percent = 100
         self._fit_mode = False
         self._base_dir = ""
@@ -1741,8 +2198,27 @@ class SlidePreviewPanel(QWidget):
 
         layout.addWidget(self._toolbar)
 
-        # --- Web View ---
+                # --- Web View ---
         self.webview = QWebEngineView()
+        
+        # ── Auto-adjust preview size to match configured render resolution ──
+        config_w = self.config.get('width', 1280)
+        config_h = self.config.get('height', 720)
+        
+        # Store base dimensions so load_html() can set the viewport correctly
+        self._preview_base_width = config_w
+        self._preview_base_height = config_h
+        
+        # Calculate how large the preview can be on the user's actual screen
+        self.webview.setMinimumSize(320, 180)
+            
+        self._current_zoom = 1.0
+        self._current_html = ""
+        self._current_base_dir = ""
+
+        # Recalculate zoom whenever the widget is resized
+        self.webview.resizeEvent = self._on_webview_resized
+
         self.webview.loadFinished.connect(self._on_load_finished)
         self.webview.setStyleSheet("background-color: #1a1a1a;")
 
@@ -1752,6 +2228,25 @@ class SlidePreviewPanel(QWidget):
     # Public API
     # ------------------------------------------------------------------
 
+    def update_preview_resolution(self, width, height):
+        """Called when the user changes the width/height in Settings.
+        Updates the viewport, recalculates the CSS zoom, and re-renders."""
+        self._preview_base_width = width
+        self._preview_base_height = height
+        
+        # Re-apply zoom with new dimensions if HTML is loaded
+        if hasattr(self, '_current_html') and self._current_html:
+            self._apply_zoom_to_preview()
+        
+        # Also update the viewport size immediately
+        if hasattr(self, 'webview') and hasattr(self.webview, 'page'):
+            try:
+                self.webview.page().setViewportSize(
+                    QSize(self._preview_base_width, self._preview_base_height)
+                )
+            except Exception as e:
+                logger.warning(f"[Preview] Failed to update viewport size: {e}")
+
     def load_file(self, html_path: str):
         """Load an HTML slide file from disk into the preview."""
         self._base_dir = os.path.dirname(os.path.abspath(html_path))
@@ -1759,9 +2254,55 @@ class SlidePreviewPanel(QWidget):
         self.webview.load(url)
 
     def load_html(self, html_content: str, base_dir: str):
-        """Load an HTML string into the preview with a base URL for relative paths."""
+        """Load an HTML string into the preview with a base URL for relative paths.
+        
+        Automatically injects a CSS zoom if the project resolution is larger
+        than the available preview area, ensuring text remains readable.
+        """
         self._base_dir = base_dir
-        base_url = QUrl.fromLocalFile(os.path.abspath(base_dir) + os.sep)
+        
+        if os.path.isfile(base_dir):
+            base_dir = os.path.dirname(base_dir)
+        
+        abs_dir = os.path.abspath(base_dir).replace(os.sep, '/') + '/'
+        base_url = QUrl.fromLocalFile(abs_dir)
+        
+        # ── Auto-Zoom for High Resolutions ──
+        zoom_css = ""
+        if hasattr(self, '_preview_base_width') and hasattr(self, 'webview'):
+            config_w = self._preview_base_width
+            config_h = self._preview_base_height
+            
+            # Current actual size of the webview widget on screen
+            actual_w = self.webview.width()
+            
+            if actual_w > 0 and config_w > 0:
+                # Calculate how much we need to zoom in
+                # e.g., if config is 3840 (4K) but widget is 960px wide, zoom = 4.0
+                zoom_factor = config_w / actual_w
+                
+                if zoom_factor > 1.1:
+                    # Inject a CSS transform to scale the content up
+                    # This makes 4K text readable in a 960px preview window
+                    zoom_css = f"""
+                    <style>
+                        html {{
+                            zoom: {zoom_factor:.2f};
+                            -moz-transform: scale({zoom_factor:.2f});
+                            -moz-transform-origin: top left;
+                        }}
+                    </style>
+                    """
+            
+            # Set viewport to actual project resolution
+            self.webview.page().setViewportSize(
+                QSize(config_w, config_h)
+            )
+        
+        # Inject zoom CSS right before </head>
+        if zoom_css and '</head>' in html_content:
+            html_content = html_content.replace('</head>', zoom_css + '</head>', 1)
+        
         self.webview.setHtml(html_content, base_url)
 
     def refresh_scale(self):
@@ -1844,6 +2385,100 @@ class SlidePreviewPanel(QWidget):
         super().resizeEvent(event)
         if self._fit_mode:
             self.fit_to_screen()
+
+    def _on_webview_resized(self, event):
+        """Recalculate zoom when the webview widget is resized."""
+        super_resize = getattr(super(type(self.webview), self.webview), 'resizeEvent', None)
+        if super_resize:
+            super_resize(event)
+        
+        # Recalculate and apply zoom
+        self._apply_zoom_to_preview()
+    
+    def _calculate_preview_zoom(self):
+        """Calculate how much to scale the content to fit the current widget size."""
+        if not hasattr(self, '_preview_base_width') or not hasattr(self, 'webview'):
+            return 1.0
+        
+        widget_w = self.webview.width()
+        widget_h = self.webview.height()
+        
+        if widget_w <= 0 or widget_h <= 0:
+            return 1.0
+        if self._preview_base_width <= 0 or self._preview_base_height <= 0:
+            return 1.0
+        
+        # Calculate scale to fit the configured resolution into the actual widget area
+        # We use 97% to leave a tiny margin so scrollbars don't appear
+        scale_w = (widget_w * 0.97) / self._preview_base_width
+        scale_h = (widget_h * 0.97) / self._preview_base_height
+        
+        # Use the smaller scale to ensure the whole slide fits
+        zoom = min(scale_w, scale_h)
+        
+        # Don't zoom beyond 100% (makes low-res slides look pixelated)
+        return min(zoom, 1.0)
+    
+    def _apply_zoom_to_preview(self):
+        """Apply the calculated zoom level to the currently loaded HTML."""
+        if not hasattr(self, '_current_html') or not self._current_html:
+            return
+        
+        zoom = self._calculate_preview_zoom()
+        self._current_zoom = zoom
+        
+        # Inject or update the zoom CSS
+        zoom_css = f"""
+        <style id="preview-zoom-style">
+            html {{
+                transform: scale({zoom:.4f});
+                transform-origin: top left;
+                width: {self._preview_base_width}px !important;
+                height: {self._preview_base_height}px !important;
+                overflow: hidden !important;
+            }}
+            body {{
+                width: {self._preview_base_width}px !important;
+                height: {self._preview_base_height}px !important;
+                overflow: hidden !important;
+            }}
+        </style>
+        """
+        
+        html_content = self._current_html
+        
+        # Remove any existing zoom style
+        import re
+        html_content = re.sub(
+            r'<style id="preview-zoom-style">.*?</style>',
+            '', html_content, flags=re.DOTALL)
+        
+        # Inject the new zoom style
+        if '</head>' in html_content:
+            html_content = html_content.replace('</head>', zoom_css + '</head>', 1)
+        else:
+            html_content = zoom_css + html_content
+        
+        # Set viewport to the configured resolution
+        if hasattr(self, '_preview_base_width') and hasattr(self, '_preview_base_height'):
+            self.webview.page().setViewportSize(
+                QSize(self._preview_base_width, self._preview_base_height)
+            )
+        
+        # Reload with the same base URL
+        if self._current_base_dir:
+            base_dir = self._current_base_dir
+            if os.path.isfile(base_dir):
+                base_dir = os.path.dirname(base_dir)
+            abs_dir = os.path.abspath(base_dir).replace(os.sep, '/') + '/'
+            base_url = QUrl.fromLocalFile(abs_dir)
+        else:
+            base_url = QUrl()
+        
+        # Block loadFinished signal to prevent infinite resize loops
+        self.webview.loadFinished.blockSignals(True)
+        self.webview.setHtml(html_content, base_url)
+        self.webview.loadFinished.blockSignals(False)
 
 
 # =================================================================
@@ -2047,6 +2682,24 @@ class SlideEditorTabWidget(QWidget):
         # Add New Slide
         self._shortcut_add_slide = QShortcut(QKeySequence("Ctrl+Shift+N"), self)
         self._shortcut_add_slide.activated.connect(self._add_slide)
+        self.refresh_from_disk()
+
+    def refresh_from_disk(self):
+        """Re-scan the project directory and reload all slides.
+        Called on init and after PDF/image import."""
+        if not hasattr(self, 'slide_list'):
+            return
+            
+        self.slide_list.clear()
+        self.refresh_from_disk()
+        
+        # Auto-select first slide to show preview
+        if self.slide_list.count() > 0:
+            self.slide_list.setCurrentRow(0)
+        else:
+            # Clear preview if no slides exist
+            if hasattr(self, 'web_view'):
+                self.web_view.setHtml("<html><body><h2>No slides found</h2></body></html>")
 
     # ------------------------------------------------------------------
     # UI Setup
@@ -2093,7 +2746,7 @@ class SlideEditorTabWidget(QWidget):
         self.list_panel.setMinimumWidth(130)
         self.list_panel.setMaximumWidth(260)
 
-        self.preview_panel = SlidePreviewPanel()
+        self.preview_panel = SlidePreviewPanel(self.config, self)
         self.preview_panel.setMinimumWidth(350)
 
         self.edit_panel = SlideEditPanel()
@@ -2101,10 +2754,28 @@ class SlideEditorTabWidget(QWidget):
 
         splitter.addWidget(self.list_panel)
         splitter.addWidget(self.preview_panel)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
         splitter.addWidget(self.edit_panel)
         splitter.setSizes([150, 620, 380])
 
         layout.addWidget(splitter, stretch=1)
+
+        # --- Import Buttons (add to toolbar area) ---
+        self.btn_import_pdf = QPushButton("📄 Import PDF")
+        self.btn_import_pdf.setToolTip("Import a PDF — each page becomes a slide")
+        self.btn_import_pdf.clicked.connect(self.on_import_pdf)
+
+        self.btn_add_image = QPushButton("🖼 Add Image")
+        self.btn_add_image.setToolTip("Add an image as a new slide")
+        self.btn_add_image.clicked.connect(self.on_add_image)
+
+        layout.addWidget(self.btn_import_pdf)
+        layout.addWidget(self.btn_add_image)
+
+        # Add these to your existing toolbar layout, e.g.:
+        # toolbar_layout.addWidget(self.btn_import_pdf)
+        # toolbar_layout.addWidget(self.btn_add_image)
 
     def _connect_signals(self):
         # Slide list
@@ -2440,3 +3111,103 @@ class SlideEditorTabWidget(QWidget):
             self.list_panel.set_current_index(b)
         except Exception as e:
             logger.error(f"Failed to swap slides: {e}")
+
+        # =================================================================
+    # PDF & IMAGE IMPORT
+    # =================================================================
+
+    def on_import_pdf(self):
+        """Import a PDF file, appending each page as a new slide."""
+        pdf_path, _ = QFileDialog.getOpenFileName(
+            self, "Import PDF", "",
+            "PDF Files (*.pdf);;All Files (*)"
+        )
+        if not pdf_path:
+            return
+        
+        try:
+            import fitz  # Early check before modifying project
+        except ImportError:
+            QMessageBox.critical(
+                self, "Missing Dependency",
+                "PyMuPDF is required for PDF import.\n\n"
+                "Install via: pip install PyMuPDF"
+            )
+            return
+        
+        # Confirm with user
+        reply = QMessageBox.question(
+            self, "Import PDF",
+            f"Import {os.path.basename(pdf_path)}?\n\n"
+            f"Each page will be appended as a new slide.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        
+        try:
+            config = self.config.settings if hasattr(self.config, 'settings') else self.config
+            count = import_pdf_append(pdf_path, self.project_path, config)
+            QMessageBox.information(
+                self, "PDF Imported",
+                f"Successfully imported {count} slide(s) from PDF."
+            )
+            # Refresh the slide list in the editor
+            self._refresh_slide_list()
+        except Exception as e:
+            logger.error(f"PDF import failed: {e}")
+            QMessageBox.critical(self, "Import Error", f"Failed to import PDF:\n{e}")
+
+    def on_add_image(self):
+        """Add an image file as a new slide."""
+        image_path, _ = QFileDialog.getOpenFileName(
+            self, "Add Image Slide", "",
+            "Image Files (*.png *.jpg *.jpeg *.gif *.bmp *.webp *.tiff);;All Files (*)"
+        )
+        if not image_path:
+            return
+        
+        try:
+            config = self.config.settings if hasattr(self.config, 'settings') else self.config
+            html_path = import_image_as_slide(image_path, self.project_path, config=config)
+            slide_num = get_next_slide_number(self.project_path) - 1  # The one just created
+            QMessageBox.information(
+                self, "Image Added",
+                f"Added image as slide {slide_num}."
+            )
+            self._refresh_slide_list()
+        except Exception as e:
+            logger.error(f"Image import failed: {e}")
+            QMessageBox.critical(self, "Import Error", f"Failed to add image slide:\n{e}")
+
+    def _refresh_slide_list(self):
+        """Refresh the slide list widget to show newly imported slides.
+        Override or implement based on your existing slide list refresh logic.
+        """
+        if hasattr(self, 'load_slides'):
+            self.load_slides()
+        elif hasattr(self, 'refresh_slides'):
+            self.refresh_slides()
+        elif hasattr(self, 'slide_list'):
+            # Manual refresh if using a QListWidget
+            self.slide_list.clear()
+            import glob
+            html_files = sorted(
+                glob.glob(os.path.join(self.project_path, "slide*.html")),
+                key=natural_sort_key
+            )
+            for html_file in html_files:
+                name = os.path.basename(html_file)
+                txt_file = os.path.splitext(html_file)[0] + ".txt"
+                has_text = os.path.exists(txt_file) and os.path.getsize(txt_file) > 0
+                
+                # Show indicator for image slides
+                if is_image_slide(html_file):
+                    label = f"🖼 {name}" + (" 📝" if has_text else " 🔇")
+                else:
+                    label = f"📄 {name}" + (" 📝" if has_text else "")
+                
+                item = QListWidgetItem(label)
+                item.setData(Qt.ItemDataRole.UserRole, html_file)
+                self.slide_list.addItem(item)

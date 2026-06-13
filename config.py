@@ -120,6 +120,12 @@ class AppConfig:
         "chunk_min_chars": 50,               # Minimum characters to form a chunk
         "chunk_audio_overlap_ms": 0,         # Audio overlap between chunks (ms) - future
         "chunk_warn_threshold": 1000,        # Warn if text exceeds this length
+
+        # ------------------------------------------------------------------
+        # SILENT / IMAGE SLIDE SETTINGS
+        # ------------------------------------------------------------------
+        "silent_slide_duration": 5.0,          # Default duration (seconds) for slides with no narration
+        "pdf_import_dpi": 200,                  # DPI for PDF page rendering
     }
 
     _init_lock = threading.Lock()

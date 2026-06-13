@@ -1,6 +1,6 @@
 {
-    "width": 1080,
-    "height": 1920,
+    "width": 1920,
+    "height": 1080,
     "fps": 30,
     "encoder": "auto",
     "preset": "fast",
@@ -48,6 +48,8 @@
     "chunk_min_chars": 50,
     "chunk_audio_overlap_ms": 0,
     "chunk_warn_threshold": 1000,
+    "silent_slide_duration": 5.0,
+    "pdf_import_dpi": 200,
     "enable_zoom": false,
     "zoom_factor": 1.1
 }

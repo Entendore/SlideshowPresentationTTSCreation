@@ -55,6 +55,8 @@ from utils import (logger, detect_ffmpeg, get_project_dirs,
                    get_library_manifest_path, load_project_manifest, 
                    should_skip_render, natural_sort_key,
                    create_slide_file, get_default_slide_html, get_image_slide_html, get_blank_slide_html,
+                   import_pdf_as_project, import_pdf_append, import_image_as_slide,
+                   get_next_slide_number, is_image_slide, generate_silent_wav,
                    get_theme, set_theme, list_themes, list_widget_stylesheet_from_theme,
                    setup_logging, initialize_project_files, get_library_status_data)
 
@@ -275,6 +277,9 @@ class MainWindow(QMainWindow):
             widget = self.tabs.widget(i)
             if isinstance(widget, SlideEditorTabWidget) and hasattr(widget, 'project_path') and widget.project_path == path:
                 self.tabs.setCurrentIndex(i)
+                # Refresh in case files were added (e.g. PDF import)
+                if hasattr(widget, 'refresh_from_disk'):
+                    widget.refresh_from_disk()
                 return
         
         editor = SlideEditorTabWidget(path, self.config, self)

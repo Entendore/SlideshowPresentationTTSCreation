@@ -12,6 +12,7 @@ import datetime
 import time
 from typing import List, Dict, Optional, Any, Tuple
 from collections import OrderedDict
+from PySide6.QtCore import QUrl
 
 # ==============================================================================
 # GLOBAL LOGGER
@@ -469,24 +470,63 @@ def get_default_slide_html(text: str) -> str:
 </body>
 </html>
 """
-
-def get_image_slide_html(image_path: str) -> str:
-    # Convert path to URL format for HTML
-    file_url = f"file:///{os.path.abspath(image_path).replace(os.sep, '/')}"
-    return f"""
-<!DOCTYPE html>
+def get_image_slide_html(image_path: str, project_path: str = "", width: int = 1280, height: int = 720) -> str:
+    """Generate HTML for a slide that displays an image full-screen with
+    black letterboxing.
+    
+    ALWAYS resolves to an absolute file:/// URL so the image displays
+    correctly in both QWebEngineView and Playwright, regardless of
+    working directory or base URL settings.
+    """
+    from PySide6.QtCore import QUrl
+    
+    # If a project_path is provided and the image_path is relative, join them
+    if project_path and not os.path.isabs(image_path):
+        abs_image_path = os.path.join(project_path, image_path)
+    else:
+        abs_image_path = image_path
+    
+    # Normalize the path
+    abs_image_path = os.path.normpath(os.path.abspath(abs_image_path))
+    
+    # Convert to a file:/// URL
+    image_url = QUrl.fromLocalFile(abs_image_path).toString()
+    
+    return f'''<!DOCTYPE html>
 <html>
 <head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
 <style>
-    body {{ margin: 0; background-color: #000; height: 100vh; display: flex; justify-content: center; align-items: center; }}
-    img {{ max-width: 100%; max-height: 100%; object-fit: contain; }}
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  html, body {{ 
+    width: {width}px; 
+    height: {height}px; 
+    overflow: hidden; 
+    /* CRITICAL: Force opaque black background to prevent Skia alpha blending bugs */
+    background-color: #000000 !important;
+    background: #000000 !important;
+  }}
+  img {{ 
+    /* Force opaque rendering to fix Skia 'unsupported format' error */
+    -webkit-background-clip: padding-box;
+    background-clip: padding-box;
+    mix-blend-mode: normal;
+    
+    max-width: 100%; 
+    max-height: 100%; 
+    object-fit: contain;
+    display: block;
+    margin: auto;
+  }}
 </style>
 </head>
 <body>
-    <img src="{file_url}" alt="Slide Image">
+  <!-- type="image/png" forces Chromium to use the correct Skia decoder -->
+  <img src="{image_url}" type="image/png" alt="Slide Image" 
+       onerror="this.style.display='none'; document.body.innerHTML='<div style=\\'color:#ff6b6b;font-size:24px;text-align:center;padding:40px;\\'>⚠ Image not found:<br>{abs_image_path}</div>'">
 </body>
-</html>
-"""
+</html>'''
 
 def get_blank_slide_html(color: str) -> str:
     return f"""
@@ -501,6 +541,31 @@ def get_blank_slide_html(color: str) -> str:
 </body>
 </html>
 """
+
+
+def get_next_slide_number(project_path: str) -> int:
+    """Find the next available slide number in a project directory."""
+    import glob as _glob
+    existing = _glob.glob(os.path.join(project_path, "slide*.html"))
+    if not existing:
+        return 1
+    numbers = []
+    for f in existing:
+        match = re.search(r"slide(\d+)\.html", os.path.basename(f))
+        if match:
+            numbers.append(int(match.group(1)))
+    return max(numbers) + 1 if numbers else 1
+
+
+def is_image_slide(html_path: str) -> bool:
+    """Check if an HTML slide is an image-only slide (PDF page or imported image)."""
+    try:
+        with open(html_path, 'r', encoding='utf-8') as f:
+            content = f.read().lower()
+        # Check for the marker patterns produced by our import functions
+        return 'images/' in content and '<img' in content
+    except Exception:
+        return False
 
 # ==============================================================================
 # AUDIO UTILITIES
@@ -522,3 +587,284 @@ def generate_silent_wav(path: str, duration: float):
             wav_file.writeframes(struct.pack('<' + 'h' * n_frames, *([0] * n_frames)))
     except Exception as e:
         logger.error(f"Failed to generate silent wav: {e}")
+
+
+
+def import_pdf_as_project(pdf_path: str, project_path: str, config: dict = None) -> int:
+    """
+    Import a PDF file, converting each page into a slide.
+    Each PDF page is rendered as a PNG image and embedded in an HTML slide.
+    
+    Args:
+        pdf_path: Path to the source PDF file.
+        project_path: Path to the project directory where slides are created.
+        config: Optional config dict (used for resolution settings).
+    
+    Returns:
+        Number of slides created.
+    
+    Raises:
+        ImportError: If PyMuPDF is not installed.
+        FileNotFoundError: If the PDF file doesn't exist.
+    """
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        raise ImportError(
+            "PyMuPDF (fitz) is required for PDF import. "
+            "Install via: pip install PyMuPDF"
+        )
+    
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+    
+    # Create images subdirectory inside the project
+    images_dir = os.path.join(project_path, "images")
+    os.makedirs(images_dir, exist_ok=True)
+    
+    # Resolution from config
+    width = 1280
+    height = 720
+    pdf_dpi = 200
+    if config:
+        width = config.get('width', 1280)
+        height = config.get('height', 720)
+        pdf_dpi = config.get('pdf_import_dpi', 200)
+    
+    doc = fitz.open(pdf_path)
+    slide_count = 0
+    
+    # Calculate zoom factor from DPI (72 is PDF default DPI)
+    zoom = pdf_dpi / 72.0
+    
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        slide_count += 1
+        
+        mat = fitz.Matrix(zoom, zoom)
+        # alpha=False prevents PyMuPDF from adding a transparency channel
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        
+        image_filename = f"pdf_page_{slide_count}.png"
+        image_path = os.path.join(images_dir, image_filename)
+        
+        if pix.alpha:
+            # Flatten alpha onto a black background
+            from PIL import Image
+            import io
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            if img.mode == 'RGBA':
+                background = Image.new('RGB', img.size, (0, 0, 0))
+                background.paste(img, mask=img.split()[3])
+                background.save(image_path, 'PNG')
+            else:
+                img.convert('RGB').save(image_path, 'PNG')
+        else:
+            pix.save(image_path, "PNG")
+        
+        # Create HTML slide referencing the image (relative path)
+        image_relative = f"images/{image_filename}"
+        html_content = get_image_slide_html(image_relative, project_path, width, height)
+        
+        html_path = os.path.join(project_path, f"slide{slide_count}.html")
+        with open(html_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        
+        # Create empty .txt file (no narration by default)
+        txt_path = os.path.join(project_path, f"slide{slide_count}.txt")
+        if not os.path.exists(txt_path):
+            with open(txt_path, 'w', encoding='utf-8') as f:
+                f.write("")
+    
+    doc.close()
+    logger.info(f"[PDF Import] Created {slide_count} slides from "
+                f"{os.path.basename(pdf_path)}")
+    return slide_count
+
+
+
+
+def import_pdf_append(pdf_path: str, project_path: str, config: dict = None) -> int:
+    """
+    Import a PDF and APPEND its pages as new slides after existing ones.
+    Unlike import_pdf_as_project which starts from slide1, this finds
+    the next available slide number.
+    
+    Returns the number of slides added.
+    """
+    try:
+        import fitz
+    except ImportError:
+        raise ImportError(
+            "PyMuPDF (fitz) is required for PDF import. "
+            "Install via: pip install PyMuPDF"
+        )
+    
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+    
+    images_dir = os.path.join(project_path, "images")
+    os.makedirs(images_dir, exist_ok=True)
+    
+    width = 1280
+    height = 720
+    pdf_dpi = 200
+    if config:
+        width = config.get('width', 1280)
+        height = config.get('height', 720)
+        pdf_dpi = config.get('pdf_import_dpi', 200)
+    
+    doc = fitz.open(pdf_path)
+    slide_num = get_next_slide_number(project_path)
+    slides_added = 0
+    zoom = pdf_dpi / 72.0
+    
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        
+        image_filename = f"pdf_page_{slide_num}.png"
+        image_path = os.path.join(images_dir, image_filename)
+        
+        if pix.alpha:
+            from PIL import Image
+            import io
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            if img.mode == 'RGBA':
+                background = Image.new('RGB', img.size, (0, 0, 0))
+                background.paste(img, mask=img.split()[3])
+                background.save(image_path, 'PNG')
+            else:
+                img.convert('RGB').save(image_path, 'PNG')
+        else:
+            pix.save(image_path, "PNG")
+        
+        image_relative = f"images/{image_filename}"
+        html_content = get_image_slide_html(image_relative, project_path, width, height)
+        
+        html_path = os.path.join(project_path, f"slide{slide_num}.html")
+        with open(html_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        
+        txt_path = os.path.join(project_path, f"slide{slide_num}.txt")
+        if not os.path.exists(txt_path):
+            with open(txt_path, 'w', encoding='utf-8') as f:
+                f.write("")
+        
+        slide_num += 1
+        slides_added += 1
+    
+    doc.close()
+    logger.info(f"[PDF Import] Appended {slides_added} slides from "
+                f"{os.path.basename(pdf_path)}")
+    return slides_added
+
+
+def import_image_as_slide(image_path: str, project_path: str,
+                          slide_number: int = None,
+                          config: dict = None) -> str:
+    """
+    Import an image as a new slide. The image is copied to the project's
+    images/ subdirectory and an HTML slide is created.
+    
+    Args:
+        image_path: Path to the source image file.
+        project_path: Path to the project directory.
+        slide_number: Slide number to assign. If None, auto-detects next.
+        config: Optional config dict for resolution.
+    
+    Returns:
+        Path to the created HTML file.
+    """
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Image file not found: {image_path}")
+    
+    if slide_number is None:
+        slide_number = get_next_slide_number(project_path)
+    
+    images_dir = os.path.join(project_path, "images")
+    os.makedirs(images_dir, exist_ok=True)
+    
+    ext = os.path.splitext(image_path)[1].lower()
+    if ext not in ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tiff', '.tif'):
+        ext = '.png'
+    
+    image_filename = f"slide_{slide_number}{ext}"
+    dest_path = os.path.join(images_dir, image_filename)
+    shutil.copy2(image_path, dest_path)
+    
+    width = 1280
+    height = 720
+    if config:
+        width = config.get('width', 1280)
+        height = config.get('height', 720)
+    
+    image_relative = f"images/{image_filename}"
+    html_content = get_image_slide_html(image_relative, project_path, width, height)
+    
+    html_path = os.path.join(project_path, f"slide{slide_number}.html")
+    with open(html_path, 'w', encoding='utf-8') as f:
+        f.write(html_content)
+    
+    txt_path = os.path.join(project_path, f"slide{slide_number}.txt")
+    if not os.path.exists(txt_path):
+        with open(txt_path, 'w', encoding='utf-8') as f:
+            f.write("")
+    
+    logger.info(f"[Image Import] Created slide {slide_number} from "
+                f"{os.path.basename(image_path)}")
+    return html_path
+
+def _ensure_png_format(source_path: str, dest_path: str) -> str:
+    """
+    Ensure the image is saved as a standard OPAQUE PNG.
+    Chromium's Skia engine throws 'Unknown or unsupported image format'
+    when loading PNGs with alpha channels via file:/// URIs.
+    Converting to RGB (no alpha) guarantees compatibility.
+    """
+    from PIL import Image
+    
+    try:
+        img = Image.open(source_path)
+        
+        # ALWAYS convert to RGB to strip alpha channel (fixes Skia bug)
+        if img.mode != 'RGB':
+            # If RGBA, paste onto a black background
+            if img.mode == 'RGBA':
+                background = Image.new('RGB', img.size, (0, 0, 0))
+                background.paste(img, mask=img.split()[3])
+                img = background
+            else:
+                img = img.convert('RGB')
+        
+        # Force the destination extension to .png
+        if not dest_path.lower().endswith('.png'):
+            dest_path = os.path.splitext(dest_path)[0] + '.png'
+        
+        img.save(dest_path, 'PNG')
+        return dest_path
+        
+    except Exception as e:
+        logger.warning(f"[Image Import] PIL conversion failed, falling back to copy: {e}")
+        shutil.copy2(source_path, dest_path)
+        return dest_path
+    
+def get_pdf_aspect_ratio(pdf_path: str) -> tuple:
+    """
+    Read the first page of a PDF and return (width, height) in points.
+    Returns (0, 0) if the PDF can't be read.
+    """
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        if len(doc) > 0:
+            page = doc[0]
+            rect = page.rect
+            doc.close()
+            return (rect.width, rect.height)
+        doc.close()
+    except Exception:
+        pass
+    return (0, 0)

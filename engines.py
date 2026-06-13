@@ -21,8 +21,8 @@ from PIL import Image
 
 # Local imports
 from utils import (
-    logger, detect_ffmpeg, natural_sort_key, build_manifest_from_timeline, 
-    save_project_manifest, update_library_manifest
+    generate_silent_wav, logger, detect_ffmpeg, natural_sort_key, build_manifest_from_timeline, 
+    save_project_manifest, update_library_manifest, is_image_slide
 )
 # Import the Backend Factory
 from backends import get_backend, get_all_audio_settings_keys
@@ -44,6 +44,8 @@ class SlideTask:
     
     source_audio_path: Optional[str] = None
     needs_tts: bool = False
+    is_silent: bool = False          
+    silent_duration: float = 5.0   
     generation_error: Optional[str] = None
 
     @property
@@ -103,12 +105,13 @@ def _get_video_settings_hash(config: dict) -> str:
 # =================================================================
 # WORKFLOW LOGIC
 # =================================================================
-
 def prepare_slide_tasks(html_files: List[str], ctx: RenderContext) -> List[SlideTask]:
     """
     Phase 1: Scan files, read text, and determine what needs to be done.
     
     Includes validation and logging for long text that will be chunked.
+    Image-only slides (PDF pages, imported images) with no narration text
+    are treated as "silent slides" — no TTS, just a fixed duration.
     """
     # 1. Load previous manifest
     manifest = {}
@@ -134,6 +137,7 @@ def prepare_slide_tasks(html_files: List[str], ctx: RenderContext) -> List[Slide
     enable_chunking = ctx.config.get("enable_text_chunking", True)
     chunk_max_chars = ctx.config.get("chunk_max_chars", 500)
     warn_threshold = ctx.config.get("chunk_warn_threshold", 1000)
+    silent_duration = ctx.config.get("silent_slide_duration", 5.0)
     
     # Create chunker for validation
     if enable_chunking:
@@ -160,28 +164,47 @@ def prepare_slide_tasks(html_files: List[str], ctx: RenderContext) -> List[Slide
         text_content = ""
         if p_txt.exists():
             text_content = p_txt.read_text(encoding="utf-8").strip()
+        
+        # Detect image-only slides
+        _is_image_slide = is_image_slide(str(p_html))
+        
         if not text_content:
-            text_content = f"This is Slide {slide_num} with no text."
+            if _is_image_slide:
+                # Image slide with no narration → silent slide
+                text_content = ""
+                _is_silent = True
+                logger.info(f"[Smart Cache] Slide {slide_num}: Image-only slide, "
+                           f"no TTS needed (duration: {silent_duration}s)")
+            else:
+                # Regular HTML slide with no text → generate default narration
+                text_content = f"This is Slide {slide_num} with no text."
+                _is_silent = False
+        else:
+            _is_silent = False
 
-        # Define cache path regardless of existence
+        # Validate text length and log warnings (only for non-silent slides)
+        if not _is_silent and text_content:
+            text_length = len(text_content)
+            if text_length > warn_threshold:
+                long_text_slides.append((slide_num, text_length))
+                if chunker and chunker.needs_chunking(text_content):
+                    chunks = chunker.chunk_text(text_content, ctx.config.get("qwen3_language", "English"))
+                    logger.info(f"[Validation] Slide {slide_num}: Long text ({text_length} chars) "
+                               f"will be split into {len(chunks)} chunks")
+                elif not enable_chunking:
+                    logger.warning(f"[Validation] Slide {slide_num}: Long text ({text_length} chars) "
+                                  f"exceeds recommended limit but chunking is disabled!")
+
+        # Define cache path
         source_audio = Path(ctx.project_path) / f"slide{slide_num}.wav"
         
-        # Validate text length and log warnings
-        text_length = len(text_content)
-        if text_length > warn_threshold:
-            long_text_slides.append((slide_num, text_length))
-            if chunker and chunker.needs_chunking(text_content):
-                chunks = chunker.chunk_text(text_content, ctx.config.get("qwen3_language", "English"))
-                logger.info(f"[Validation] Slide {slide_num}: Long text ({text_length} chars) "
-                           f"will be split into {len(chunks)} chunks")
-            elif not enable_chunking:
-                logger.warning(f"[Validation] Slide {slide_num}: Long text ({text_length} chars) "
-                              f"exceeds recommended limit but chunking is disabled!")
-
         # Decision Logic
         needs_tts = False
         
-        if settings_changed:
+        if _is_silent:
+            # Silent slides never need TTS
+            needs_tts = False
+        elif settings_changed:
             needs_tts = True
         elif source_audio.exists():
             try:
@@ -207,7 +230,9 @@ def prepare_slide_tasks(html_files: List[str], ctx: RenderContext) -> List[Slide
             target_audio_path=str(target_audio),
             text_content=text_content,
             source_audio_path=str(source_audio),
-            needs_tts=needs_tts
+            needs_tts=needs_tts,
+            is_silent=_is_silent,
+            silent_duration=silent_duration
         )
         tasks.append(task)
     
@@ -228,9 +253,10 @@ async def process_audio_tasks(tasks: List[SlideTask], ctx: RenderContext, msg_qu
     tasks_to_copy = [t for t in tasks if t.source_audio_path and os.path.exists(t.source_audio_path) and not t.needs_tts]
     tasks_to_generate = [t for t in tasks if t.needs_tts]
     total_to_generate = len(tasks_to_generate)
+    tasks_to_silence = [t for t in tasks if t.is_silent and not os.path.exists(t.target_audio_path)]
     completed_count = 0
     
-    logger.info(f"[Worker] Partition: {len(tasks_to_copy)} to copy, {total_to_generate} to generate.")
+    logger.info(f"[Worker] Partition: {len(tasks_to_copy)} to copy, {total_to_generate} to generate, {len(tasks_to_silence)} to silence.")
     
     # --- Sub-Phase 2a: Copy Existing Files ---
     for task in tasks_to_copy:
@@ -239,6 +265,15 @@ async def process_audio_tasks(tasks: List[SlideTask], ctx: RenderContext, msg_qu
         except Exception as e:
             logger.error(f"Failed to copy {task.source_audio_path}: {e}")
             task.generation_error = str(e)
+
+    
+    # --- Sub-Phase 2a.5: Generate Silent WAV for Image Slides ---
+    for task in tasks_to_silence:
+        duration = task.silent_duration
+        logger.info(f"[Worker] Generating silent audio ({duration}s) for slide {task.slide_number}")
+        if not generate_silent_wav(task.target_audio_path, duration):
+            logger.error(f"[Worker] Failed to generate silent audio for slide {task.slide_number}")
+            task.generation_error = "Failed to generate silent audio"
 
     # --- Sub-Phase 2b: TTS Generation via Backend ---
     if not tasks_to_generate:
@@ -327,18 +362,35 @@ async def process_audio_tasks(tasks: List[SlideTask], ctx: RenderContext, msg_qu
 def build_timeline(tasks: List[SlideTask]) -> List[dict]:
     """
     Phase 3: Assemble the final timeline for the video renderer.
+    Silent slides use their configured duration.
     """
     timeline = []
     for task in tasks:
         duration = 3.0
-        if Path(task.target_audio_path).exists():
+        
+        if task.is_silent and not Path(task.target_audio_path).exists():
+            # Silent image slide with no audio file — use configured duration
+            duration = task.silent_duration
+        elif Path(task.target_audio_path).exists():
             try:
                 with wave.open(task.target_audio_path, 'r') as w:
                     duration = w.getnframes() / float(w.getframerate())
-            except Exception: pass
+            except Exception:
+                if task.is_silent:
+                    duration = task.silent_duration
+                else:
+                    duration = max(3.0, len(task.text_content.split()) / 2.5)
         else:
-            duration = max(3.0, len(task.text_content.split()) / 2.5)
-        timeline.append({'html': task.html_path, 'audio': task.target_audio_path, 'duration': duration})
+            if task.is_silent:
+                duration = task.silent_duration
+            else:
+                duration = max(3.0, len(task.text_content.split()) / 2.5)
+        
+        timeline.append({
+            'html': task.html_path,
+            'audio': task.target_audio_path,
+            'duration': duration
+        })
     return timeline
 
 # =================================================================
@@ -726,8 +778,27 @@ def render_project_worker(project_path, msg_queue, config):
             for item in timeline:
                 html_path = item['html']
                 txt_path = os.path.splitext(html_path)[0] + ".txt"
-                if os.path.exists(html_path): assets_meta[os.path.basename(html_path)] = {"mtime": os.path.getmtime(html_path), "size": os.path.getsize(html_path)}
-                if os.path.exists(txt_path): assets_meta[os.path.basename(txt_path)] = {"mtime": os.path.getmtime(txt_path), "size": os.path.getsize(txt_path)}
+                if os.path.exists(html_path): 
+                    assets_meta[os.path.basename(html_path)] = {
+                        "mtime": os.path.getmtime(html_path), 
+                        "size": os.path.getsize(html_path)
+                    }
+                if os.path.exists(txt_path): 
+                    assets_meta[os.path.basename(txt_path)] = {
+                        "mtime": os.path.getmtime(txt_path), 
+                        "size": os.path.getsize(txt_path)
+                    }
+            
+            # replacing an image triggers a re-render
+            images_dir = os.path.join(project_path, "images")
+            if os.path.isdir(images_dir):
+                for img_name in os.listdir(images_dir):
+                    img_path = os.path.join(images_dir, img_name)
+                    if os.path.isfile(img_path):
+                        assets_meta[f"images/{img_name}"] = {
+                            "mtime": os.path.getmtime(img_path),
+                            "size": os.path.getsize(img_path)
+                        }
 
             manifest_data = build_manifest_from_timeline(project_name, project_path, config, timeline, output_dir, final_video, 'full', assets_meta)
             manifest_data['audio_settings_hash'] = _get_audio_settings_hash(ctx.config)
