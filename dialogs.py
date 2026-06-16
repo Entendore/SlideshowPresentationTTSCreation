@@ -2,6 +2,7 @@
 import os
 import sys
 import re
+import json 
 import shutil
 import tempfile
 import logging
@@ -18,7 +19,7 @@ from PySide6.QtWidgets import (
     QSplitter, QMessageBox, QSizePolicy, QTextEdit, QGroupBox,
     QCheckBox, QLabel, QLineEdit, QFileDialog, QTabWidget,
     QPlainTextEdit, QStackedWidget, QListWidget, QListWidgetItem, QScrollArea,
-    QInputDialog
+    QInputDialog, QRadioButton
 )
 from PySide6.QtCore import Qt, QTimer, QMetaObject, QSize, QUrl, Signal, QTimer, QSize, QUrl
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -26,20 +27,50 @@ from PySide6.QtGui import QShortcut, QKeySequence, QFont, QColor, QPalette
 
 # Local imports
 from utils import (
-    logger, get_theme, natural_sort_key,
-    create_slide_file, get_default_slide_html, get_blank_slide_html, is_image_slide, get_image_slide_html,
-    import_pdf_append, import_image_as_slide, get_next_slide_number, import_pdf_as_project, get_pdf_aspect_ratio
+    create_slide_file, get_default_slide_html, get_next_slide_number,
+    import_file_as_project, import_file_append, initialize_project_files, natural_sort_key,
+    Palette, style_input, style_button, style_primary_button,
+    style_page_widget, style_group_box, style_radio, style_checkbox,
+    style_summary_label,  FILE_FILTER_IMPORT, FILE_FILTER_SCRIPT,
 )
 
 from config import AppConfig
 import backends
 
+logger = logging.getLogger(__name__)
 
 # =================================================================
 # ILLEGAL FILENAME CHARACTERS (cross-platform)
 # =================================================================
 
 _ILLEGAL_NAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _ask_overwrite_or_append(parent: QWidget, project_name: str):
+    """Show a dialog asking the user what to do when a project already exists.
+
+    Returns:
+        "overwrite" – delete existing project and re-create
+        "append"   – add slides to the existing project
+        None       – user cancelled
+    """
+    msg = QMessageBox(parent)
+    msg.setIcon(QMessageBox.Icon.Warning)
+    msg.setWindowTitle("Project Already Exists")
+    msg.setText(f"Project '{project_name}' already exists.")
+    msg.setInformativeText("What would you like to do?")
+    btn_overwrite = msg.addButton("Overwrite", QMessageBox.ButtonRole.AcceptRole)
+    btn_append = msg.addButton("Append", QMessageBox.ButtonRole.AcceptRole)
+    btn_cancel = msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+    msg.setDefaultButton(btn_append)
+    msg.exec()
+    clicked = msg.clickedButton()
+    if clicked == btn_overwrite:
+        return "overwrite"
+    elif clicked == btn_append:
+        return "append"
+    else:
+        return None
 
 
 def _sanitize_project_name(name: str) -> str:
@@ -51,10 +82,6 @@ def _sanitize_project_name(name: str) -> str:
     name = name.rstrip('.')
     return name
 
-
-# =================================================================
-# CUSTOM WIDGETS
-# =================================================================
 
 # =================================================================
 # MODULAR SUB-COMPONENTS
@@ -187,45 +214,53 @@ class StatusTheme:
     """
     Single source of truth for status → color mapping.
     All visual components query this instead of hardcoding colors.
+
+    Keys use the **capitalized** form that matches RenderStatus enum values
+    (e.g. "Rendering", "Ready", "Outdated", "Error", "Pending") so that
+    update_status() lookups work without case conversion.
     """
     # Strip colors
     STRIP = {
         "default":  "#555555",
-        "unknown":  "#666666",
-        "queued":   "#f0ad4e",
-        "rendering":"#0078d4",
-        "ready":    "#28a745",
-        "error":    "#dc3545",
+        "New":      "#f0ad4e",     # brand-new project, never rendered
+        "Outdated": "#f0ad4e",     # needs render (was Outdated/unknown)
+        "Pending":  "#f0ad4e",     # queued
+        "Rendering":"#0078d4",     # actively rendering
+        "Ready":    "#28a745",     # completed
+        "Error":    "#dc3545",     # failed
     }
 
     # Badge colors: (bg, text, border)
     BADGE = {
         "default":  ("#444444", "#999999", "#555555"),
-        "unknown":  ("#3a3a3a", "#888888", "#4a4a4a"),
-        "queued":   ("#f0ad4e", "#1a1a1a", "#d99a3e"),
-        "rendering":("#0078d4", "#ffffff", "#006abc"),
-        "ready":    ("#28a745", "#ffffff", "#1e7e34"),
-        "error":    ("#dc3545", "#ffffff", "#bd2130"),
+        "New":      ("#f0ad4e", "#1a1a1a", "#d99a3e"),
+        "Outdated": ("#f0ad4e", "#1a1a1a", "#d99a3e"),
+        "Pending":  ("#f0ad4e", "#1a1a1a", "#d99a3e"),
+        "Rendering":("#0078d4", "#ffffff", "#006abc"),
+        "Ready":    ("#28a745", "#ffffff", "#1e7e34"),
+        "Error":    ("#dc3545", "#ffffff", "#bd2130"),
     }
 
     # Badge labels
     LABEL = {
         "default":  "NEW",
-        "unknown":  "TODO",
-        "queued":   "WAIT",
-        "rendering":"...",
-        "ready":    "DONE",
-        "error":    "ERR",
+        "New":      "NEW",
+        "Outdated": "TODO",
+        "Pending":  "WAIT",
+        "Rendering":"...",
+        "Ready":    "DONE",
+        "Error":    "ERR",
     }
 
     # Detail text defaults
     DETAIL_COLOR = {
         "default":  "#888888",
-        "unknown":  "#888888",
-        "queued":   "#c8a460",
-        "rendering":"#66a3d2",
-        "ready":    "#6abf7b",
-        "error":    "#e87878",
+        "New":      "#c8a460",
+        "Outdated": "#c8a460",
+        "Pending":  "#c8a460",
+        "Rendering":"#66a3d2",
+        "Ready":    "#6abf7b",
+        "Error":    "#e87878",
     }
 
     @classmethod
@@ -369,11 +404,27 @@ class ProjectListItemWidget(QWidget):
         return self._sel_state.is_selected(self.path)
 
     def update_status(self, status: str, progress_pct: int = 0,
-                      detail_text: str = ""):
+                      detail_text: str = "", slide_count: int = 0,
+                      source: str = ""):
         """Update the project's rendering status and refresh all sub-components."""
         self._current_status = status
         self._progress_pct = progress_pct
         self._detail_text = detail_text or self._default_detail(status)
+
+        # Enrich detail text with slide count and source
+        extra_parts = []
+        if slide_count:
+            extra_parts.append(f"{slide_count} slide{'s' if slide_count != 1 else ''}")
+        if source:
+            source_display = {
+                "pdf": "PDF", "pptx": "PPTX", "json_speaker_script": "JSON",
+                "json": "JSON", "txt": "TXT", "csv": "CSV", "image": "Image",
+                "blank": "Blank",
+            }.get(source, source.upper() if source else "")
+            if source_display:
+                extra_parts.append(f"from {source_display}")
+        if extra_parts:
+            self._detail_text = f"{self._detail_text}  ·  {'  '.join(extra_parts)}"
 
         # Strip
         self.strip.set_color(StatusTheme.strip_color(status))
@@ -461,17 +512,18 @@ class ProjectListItemWidget(QWidget):
     @staticmethod
     def _default_detail(status: str) -> str:
         defaults = {
-            "unknown": "Not Rendered",
-            "queued": "Waiting in queue...",
-            "rendering": "Processing...",
-            "ready": "Completed",
-            "error": "Failed — Check Logs",
+            "New": "New Project",
+            "Outdated": "Needs Render",
+            "Pending": "Queued",
+            "Rendering": "Processing...",
+            "Ready": "Completed",
+            "Error": "Failed — Check Logs",
         }
         return defaults.get(status, "Not Rendered")
 
     @staticmethod
     def _badge_label(status: str, pct: int) -> str:
-        if status == "rendering" and pct > 0:
+        if status == "Rendering" and pct > 0:
             return f"{pct}%"
         return StatusTheme.badge_label(status)
 
@@ -546,27 +598,42 @@ class QTextEditLogger(logging.Handler):
             '%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S'
         ))
 
-    def emit(self, record):
+    def emit(self, record: logging.LogRecord) -> None:
         try:
-            text_edit = self._text_edit_ref()
-            if text_edit is None:
+            # Prevent crashes if the widget was deleted during app shutdown
+            if not self._widget or not self._widget.isVisible():
                 return
-            msg = self.format(record)
-            msg = html.escape(msg)
-            msg = msg.replace("\n", "<br>")
-            color = "#d4d4d4"
-            if record.levelno >= logging.ERROR:
-                color = "#ff6b6b"
-            elif record.levelno >= logging.WARNING:
-                color = "#f1c40f"
-            elif record.levelname == "INFO":
-                color = "#3498db"
-            html_msg = f'<span style="color:{color}">{msg}</span>'
+        except RuntimeError:
+            return
 
-            QMetaObject.invokeMethod(
-                text_edit, "append",
-                Qt.ConnectionType.QueuedConnection, html_msg
+        try:
+            msg = self.format(record)
+            color = self.LEVEL_COLORS.get(record.levelno, "#D4D4D4")
+            tag = self.LEVEL_TAGS.get(record.levelno, "???")
+            timestamp = datetime.now().strftime("%H:%M:%S")
+
+            safe_msg = (
+                msg.replace("&", "&amp;")
+                   .replace("<", "&lt;")
+                   .replace(">", "&gt;")
             )
+
+            html = (
+                f'<span style="color:#666666">[{timestamp}]</span> '
+                f'<span style="color:{color};font-weight:bold">[{tag}]</span> '
+                f'<span style="color:{color}">{safe_msg}</span>'
+            )
+
+            sb = self._widget.verticalScrollBar()
+            at_bottom = sb.value() >= sb.maximum() - 30
+
+            self._widget.append(html)
+            self._trim_lines()
+
+            if at_bottom:
+                sb.setValue(sb.maximum())
+        except RuntimeError:
+            pass  # Silently ignore if C++ object was deleted
         except Exception:
             self.handleError(record)
 
@@ -583,6 +650,7 @@ class SettingsTabWidget(QWidget):
 
     AUTO_SAVE_DELAY_MS = 600
 
+
     # Resolution presets: (display_name, landscape_width, landscape_height)
     RESOLUTION_PRESETS = [
         ("4K UHD (2160p)",  3840, 2160),
@@ -596,7 +664,9 @@ class SettingsTabWidget(QWidget):
 
     def __init__(self, config, parent=None):
         super().__init__(parent)
-        self.config = config
+
+        self.config = config 
+
 
         # Debounce timer for settings that change rapidly
         self._settings_timer = QTimer(self)
@@ -1012,13 +1082,43 @@ class SettingsTabWidget(QWidget):
         selector_layout = QHBoxLayout()
         selector_layout.addWidget(QLabel("<b>Active Engine:</b>"))
 
+        from backends import get_backend_info
+        
+        backend_info = get_backend_info()
+        current_backend = self.config.get("active_backend", "edge")
+        
+        # 1. Create the combo box
         self.backend_combo = QComboBox()
-        for name in backends.BACKEND_MAP.keys():
-            display_name = name.replace("_", " ").title()
-            self.backend_combo.addItem(display_name, name)
+        
+        # 2. Populate it dynamically
+        for backend_name, info in backend_info.items():
+            # Make the name look nice in the UI (e.g., "edge" -> "Edge")
+            display_name = backend_name.replace("_", " ").title()
+            self.backend_combo.addItem(display_name, userData=backend_name)
+            
+            # Grey out backends whose dependencies aren't installed
+            if not info["available"]:
+                item = self.backend_combo.model().item(self.backend_combo.count() - 1)
+                item.setEnabled(False)
+                item.setToolTip("Install required dependencies to enable this backend")
+                
+        # 3. Fallback logic: if the configured backend isn't available, 
+        # select the first available one
+        if not backend_info.get(current_backend, {}).get("available", False):
+            for backend_name, info in backend_info.items():
+                if info["available"]:
+                    current_backend = backend_name
+                    break
 
+        # 4. Set the active selection in the UI
+        idx = self.backend_combo.findData(current_backend)
+        if idx >= 0:
+            self.backend_combo.setCurrentIndex(idx)
+
+        # 5. Connect signal and add to layout
         self.backend_combo.currentIndexChanged.connect(
-            self.on_backend_selection_changed)
+            self.on_backend_selection_changed
+        )
         selector_layout.addWidget(self.backend_combo, 1)
 
         # Mode Selector
@@ -1509,488 +1609,533 @@ class SettingsTabWidget(QWidget):
         layout.addWidget(btn_copy)
         return page
 
-
-# =================================================================
-# NEW PROJECT TAB WIDGET
-# =================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+#  NEW PROJECT TAB WIDGET — Unified project creation with optional import
+#  and speaker script support
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class NewProjectTabWidget(QWidget):
-    def __init__(self, config, on_project_created_callback, parent=None):
+    """Unified project creation widget — minimalist styling."""
+
+    def __init__(
+        self,
+        config: AppConfig,
+        on_created_callback,
+        prefill_import_path: str = "",
+        parent=None,
+    ):
         super().__init__(parent)
         self.config = config
-        self.on_project_created = on_project_created_callback
+        self._on_created = on_created_callback
+        self._prefill_import = prefill_import_path
         self.init_ui()
 
+    # ══════════════════════════════════════════════════════════════════════
+    #  UI CONSTRUCTION
+    # ══════════════════════════════════════════════════════════════════════
+
     def init_ui(self):
-        layout = QFormLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
+        self.setStyleSheet(style_page_widget())
+        root = QVBoxLayout(self)
+        root.setContentsMargins(40, 32, 40, 24)
+        root.setSpacing(0)
 
-        self.name_input = QLineEdit()
-        self.name_input.setPlaceholderText("My Awesome Video")
+        # ── Header ────────────────────────────────────────────────────────
+        title = QLabel("New Project")
+        title.setFont(QFont("Segoe UI", 18, QFont.Weight.Bold))
+        title.setStyleSheet(f"color: {Palette.TEXT}; margin-bottom: 2px;")
+        root.addWidget(title)
 
-        self.type_combo = QComboBox()
-        self.type_combo.addItems(["Blank Slide", "Text Slide", "Image Slide"])
-        self.type_combo.currentIndexChanged.connect(self.on_type_changed)
-
-        self.content_input = QLineEdit()
-        self.content_input.setPlaceholderText("Enter text or select image...")
-        self.content_input.setEnabled(False)  # Disabled by default for "Blank Slide"
-
-        self.btn_browse = QPushButton("...")
-        self.btn_browse.setMaximumWidth(40)
-        self.btn_browse.clicked.connect(self.browse_content)
-        self.btn_browse.setVisible(False)
-
-        content_layout = QHBoxLayout()
-        content_layout.addWidget(self.content_input)
-        content_layout.addWidget(self.btn_browse)
-
-        self.btn_create = QPushButton("Create New Project")
-        self.btn_create.setStyleSheet(
-            "background-color: #28a745; color: white; "
-            "font-weight: bold; padding: 8px;")
-        self.btn_create.clicked.connect(self.create_project)
-
-        layout.addRow("Project Name:", self.name_input)
-        layout.addRow("Initial Slide Type:", self.type_combo)
-        layout.addRow("Content:", content_layout)
-        layout.addRow(self.btn_create)
-        layout.addRow(QLabel(
-            "<i>Note: Project will be created and added to the library.</i>"))
-        
-        self.chk_from_pdf = QCheckBox("Create from PDF (each page = 1 slide)")
-        self.chk_from_pdf.toggled.connect(self.on_from_pdf_toggled)
-        # Add to your form layout
-        
-        self.pdf_path_edit = QLineEdit()
-        self.pdf_path_edit.setPlaceholderText("Select a PDF file...")
-        self.pdf_path_edit.setEnabled(False)
-        
-        self.btn_browse_pdf = QPushButton("Browse...")
-        self.btn_browse_pdf.setEnabled(False)
-        self.btn_browse_pdf.clicked.connect(self.browse_pdf)
-        
-        pdf_row = QHBoxLayout()
-        pdf_row.addWidget(self.pdf_path_edit)
-        pdf_row.addWidget(self.btn_browse_pdf)
-
-        layout.addRow(self.chk_from_pdf)
-        layout.addRow("PDF File:", pdf_row)
-
-        # Add to form layout:
-        # form_layout.addRow(self.chk_from_pdf)
-        # form_layout.addRow("PDF File:", pdf_row)
-
-    def _auto_adjust_orientation_for_pdf(self, pdf_path: str):
-        """Automatically switch the video orientation to match the PDF."""
-        pdf_w, pdf_h = get_pdf_aspect_ratio(pdf_path)
-        if pdf_w <= 0 or pdf_h <= 0:
-            return
-        
-        config_dict = (
-            self.config.settings
-            if hasattr(self.config, 'settings')
-            else self.config
+        subtitle = QLabel(
+            "Create a blank project, import a file, or attach a narration script."
         )
-        vid_w = config_dict.get('width', 1280)
-        vid_h = config_dict.get('height', 720)
-        
-        pdf_is_landscape = pdf_w > pdf_h
-        vid_is_landscape = vid_w > vid_h
-        
-        if pdf_is_landscape != vid_is_landscape:
-            # Orientation mismatch - offer to fix it
-            pdf_orientation = "Landscape (Horizontal)" if pdf_is_landscape else "Portrait (Vertical)"
-            
-            reply = QMessageBox.question(
-                self, "Auto-Adjust Orientation?",
-                f"Your PDF is <b>{pdf_orientation}</b>, but your video is set to "
-                f"<b>{vid_w}x{vid_h}</b>.<br><br>"
-                f"Would you like to automatically switch the video orientation to match?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.Yes
-            )
-            
-            if reply == QMessageBox.StandardButton.Yes:
-                # Swap width and height in config
-                new_w = vid_h
-                new_h = vid_w
-                
-                config_dict['width'] = new_w
-                config_dict['height'] = new_h
-                
-                # Save to settings
-                if hasattr(self.config, 'set'):
-                    self.config.set('width', new_w)
-                    self.config.set('height', new_h)
-                
-                logger.info(f"[PDF Import] Auto-adjusted video orientation to {new_w}x{new_h}")
-                
-                # ── Push the new resolution to the open Settings Tab and Preview Panel ──
-                parent = self.parent()
-                while parent:
-                    if hasattr(parent, 'tabs'):  # Found MainWindow
-                        for i in range(parent.tabs.count()):
-                            widget = parent.tabs.widget(i)
-                            
-                            # Update Settings Tab UI
-                            if isinstance(widget, SettingsTabWidget):
-                                if hasattr(widget, 'refresh_ui_values'):
-                                    widget.refresh_ui_values()
-                            
-                            # Update Slide Editor Preview Panel
-                            if isinstance(widget, SlideEditorTabWidget):
-                                if hasattr(widget, 'preview_panel') and hasattr(widget.preview_panel, 'update_preview_resolution'):
-                                    widget.preview_panel.update_preview_resolution(new_w, new_h)
-                        
-                        break
-                    parent = parent.parent()
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet(f"color: {Palette.TEXT_DIM}; font-size: 12px; margin-bottom: 20px;")
+        root.addWidget(subtitle)
 
-    def on_from_pdf_toggled(self, checked):
-        self.pdf_path_edit.setEnabled(checked)
-        self.btn_browse_pdf.setEnabled(checked)
+        # ── Project Name ──────────────────────────────────────────────────
+        grp_name = QGroupBox("Project Name")
+        grp_name.setStyleSheet(style_group_box())
+        name_lay = QVBoxLayout()
+        name_lay.setContentsMargins(0, 6, 0, 4)
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("e.g. My Presentation")
+        self.name_edit.setStyleSheet(style_input())
+        self.name_edit.textChanged.connect(self._update_summary)
+        name_lay.addWidget(self.name_edit)
+        grp_name.setLayout(name_lay)
+        root.addWidget(grp_name)
 
-    def browse_pdf(self):
-        pdf_path, _ = QFileDialog.getOpenFileName(
-            self, "Select PDF", "",
-            "PDF Files (*.pdf);;All Files (*)"
+        # ── Slide Content Source ──────────────────────────────────────────
+        grp_content = QGroupBox("Slide Content")
+        grp_content.setStyleSheet(style_group_box())
+        content_lay = QVBoxLayout()
+        content_lay.setContentsMargins(0, 6, 0, 4)
+        content_lay.setSpacing(8)
+
+        self.radio_blank = QRadioButton("Blank project")
+        self.radio_blank.setStyleSheet(style_radio())
+        self.radio_blank.setChecked(True)
+
+        self.radio_import = QRadioButton("Import from file")
+        self.radio_import.setStyleSheet(style_radio())
+
+        import_row = QHBoxLayout()
+        import_row.setContentsMargins(20, 0, 0, 0)
+        self.import_path_edit = QLineEdit()
+        self.import_path_edit.setPlaceholderText("PDF, PPTX, TXT, CSV, or JSON…")
+        self.import_path_edit.setStyleSheet(style_input())
+        self.import_path_edit.setEnabled(False)
+        self.import_path_edit.textChanged.connect(self._update_summary)
+
+        self.import_browse_btn = QPushButton("Browse")
+        self.import_browse_btn.setStyleSheet(style_button())
+        self.import_browse_btn.setEnabled(False)
+        self.import_browse_btn.setFixedWidth(72)
+        self.import_browse_btn.clicked.connect(self._browse_import_file)
+
+        import_row.addWidget(self.import_path_edit, stretch=1)
+        import_row.addWidget(self.import_browse_btn)
+
+        self.radio_blank.toggled.connect(self._on_content_mode_changed)
+        self.radio_import.toggled.connect(self._on_content_mode_changed)
+
+        content_lay.addWidget(self.radio_blank)
+        content_lay.addWidget(self.radio_import)
+        content_lay.addLayout(import_row)
+        grp_content.setLayout(content_lay)
+        root.addWidget(grp_content)
+
+        # ── Narration Script ──────────────────────────────────────────────
+        grp_script = QGroupBox("Narration Script")
+        grp_script.setStyleSheet(style_group_box())
+        script_lay = QVBoxLayout()
+        script_lay.setContentsMargins(0, 6, 0, 4)
+        script_lay.setSpacing(8)
+
+        script_hint = QLabel("Optional — PDF, TXT, CSV, or JSON with blank-line or structured sections.")
+        script_hint.setWordWrap(True)
+        script_hint.setStyleSheet(f"color: {Palette.TEXT_DIM}; font-size: 11px;")
+
+        script_row = QHBoxLayout()
+        self.script_path_edit = QLineEdit()
+        self.script_path_edit.setPlaceholderText("Select a .txt script file…")
+        self.script_path_edit.setStyleSheet(style_input())
+        self.script_path_edit.textChanged.connect(self._update_summary)
+
+        self.script_browse_btn = QPushButton("Browse")
+        self.script_browse_btn.setStyleSheet(style_button())
+        self.script_browse_btn.setFixedWidth(72)
+        self.script_browse_btn.clicked.connect(self._browse_script_file)
+
+        script_row.addWidget(self.script_path_edit, stretch=1)
+        script_row.addWidget(self.script_browse_btn)
+
+        self.chk_override_text = QCheckBox("Replace existing slide text with script")
+        self.chk_override_text.setChecked(True)
+        self.chk_override_text.setStyleSheet(style_checkbox())
+
+        script_lay.addWidget(script_hint)
+        script_lay.addLayout(script_row)
+        script_lay.addWidget(self.chk_override_text)
+        grp_script.setLayout(script_lay)
+        root.addWidget(grp_script)
+
+        # ── Resolution ────────────────────────────────────────────────────
+        grp_res = QGroupBox("Resolution")
+        grp_res.setStyleSheet(style_group_box())
+        res_lay = QHBoxLayout()
+        res_lay.setContentsMargins(0, 6, 0, 4)
+
+        self.resolution_combo = QComboBox()
+        self.resolution_combo.setStyleSheet(style_input())
+        current_w = self.config.get("width", 1280)
+        current_h = self.config.get("height", 720)
+        current_res_idx = 0
+        for i, (preset_name, (w, h)) in enumerate(
+            AppConfig.RESOLUTION_PRESETS.items()
+        ):
+            self.resolution_combo.addItem(preset_name)
+            if w == current_w and h == current_h:
+                current_res_idx = i
+        self.resolution_combo.setCurrentIndex(current_res_idx)
+        self.resolution_combo.currentTextChanged.connect(self._update_summary)
+
+        res_lay.addWidget(self.resolution_combo)
+        res_lay.addStretch()
+        grp_res.setLayout(res_lay)
+        root.addWidget(grp_res)
+
+        # ── Summary ───────────────────────────────────────────────────────
+        self.summary_label = QLabel()
+        self.summary_label.setWordWrap(True)
+        self.summary_label.setStyleSheet(style_summary_label())
+        self.summary_label.setMinimumHeight(40)
+        root.addWidget(self.summary_label)
+
+        root.addSpacing(12)
+
+        # ── Buttons ───────────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.setStyleSheet(style_button())
+        self.btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_cancel.clicked.connect(self._cancel)
+
+        self.btn_create = QPushButton("Create")
+        self.btn_create.setStyleSheet(style_primary_button())
+        self.btn_create.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_create.clicked.connect(self._create_project)
+
+        btn_row.addWidget(self.btn_cancel)
+        btn_row.addSpacing(8)
+        btn_row.addWidget(self.btn_create)
+        root.addLayout(btn_row)
+
+        root.addStretch()
+
+        # ── Prefill from quick-import ─────────────────────────────────────
+        if self._prefill_import:
+            self.radio_import.setChecked(True)
+            self.import_path_edit.setText(self._prefill_import)
+            if not self.name_edit.text().strip():
+                self.name_edit.setText(
+                    os.path.splitext(os.path.basename(self._prefill_import))[0]
+                )
+
+        self._update_summary()
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  UI EVENT HANDLERS
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _on_content_mode_changed(self):
+        is_import = self.radio_import.isChecked()
+        self.import_path_edit.setEnabled(is_import)
+        self.import_browse_btn.setEnabled(is_import)
+        if is_import and not self.import_path_edit.text().strip():
+            self._browse_import_file()
+        self._update_summary()
+
+    def _browse_import_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select File to Import", "", FILE_FILTER_IMPORT
         )
-        if pdf_path:
-            self.pdf_path_edit.setText(pdf_path)
+        if path:
+            self.import_path_edit.setText(path)
+            if not self.name_edit.text().strip():
+                self.name_edit.setText(
+                    os.path.splitext(os.path.basename(path))[0]
+                )
 
-    def on_type_changed(self, index):
-        slide_type = self.type_combo.currentText()
-        if slide_type == "Image Slide":
-            self.content_input.setPlaceholderText("Path to image...")
-            self.content_input.setEnabled(True)
-            self.btn_browse.setVisible(True)
-        elif slide_type == "Text Slide":
-            self.content_input.setPlaceholderText("Enter text for slide...")
-            self.content_input.setEnabled(True)
-            self.btn_browse.setVisible(False)
-        else:  # Blank Slide
-            self.content_input.clear()
-            self.content_input.setEnabled(False)
-            self.btn_browse.setVisible(False)
-
-    def browse_content(self):
-        f, _ = QFileDialog.getOpenFileName(
-            self, "Select Image", "", "Images (*.png *.jpg *.jpeg)")
-        if f:
-            self.content_input.setText(f)
-
-    def create_project(self):
-        """Create a new project with support for PDF import and
-        override/append when a project folder already exists."""
-        project_name = self.name_input.text().strip()
-        project_name = _sanitize_project_name(project_name)
-        if not project_name:
-            QMessageBox.warning(self, "Error", "Please enter a project name.")
-            return
-
-        # Double-check after sanitization
-        project_name = _sanitize_project_name(project_name)
-        if not project_name:
-            QMessageBox.warning(
-                self, "Input Error",
-                "Project name contains only invalid characters.")
-            return
-
-        root_dir = self.config.get(
-            'projects_root', os.path.join(os.getcwd(), "Projects"))
-        if not os.path.exists(root_dir):
+    def _browse_script_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Narration Script", "", FILE_FILTER_SCRIPT
+        )
+        if path:
+            self.script_path_edit.setText(path)
             try:
-                os.makedirs(root_dir)
-            except OSError as e:
-                QMessageBox.critical(
-                    self, "Error",
-                    f"Could not create projects directory: {e}")
-                return
+                content = self._read_file_text(path).strip()
+                sections = self._parse_script_sections(content)
+                logger.info(
+                    f"[NewProject] Script preview: {len(sections)} section(s)"
+                )
+            except Exception as exc:
+                logger.warning(f"[NewProject] Script preview failed: {exc}")
 
-        project_path = os.path.join(root_dir, project_name)
-        pdf_import_requested = (
-            self.chk_from_pdf.isChecked()
-            and self.pdf_path_edit.text().strip()
-        )
+    # ══════════════════════════════════════════════════════════════════════
+    #  LIVE SUMMARY
+    # ══════════════════════════════════════════════════════════════════════
 
-        # ══════════════════════════════════════════════════════════
-        # HANDLE EXISTING PROJECT DIRECTORY
-        # ══════════════════════════════════════════════════════════
-        if os.path.exists(project_path):
-            # Build a message showing what's in the existing folder
-            existing_items = []
+    def _update_summary(self):
+        name = self.name_edit.text().strip()
+        is_import = self.radio_import.isChecked()
+        import_path = self.import_path_edit.text().strip() if is_import else ""
+        script_path = self.script_path_edit.text().strip()
+
+        parts = []
+
+        if not name:
+            parts.append(f'<span style="color:{Palette.WARNING}">Enter a project name to continue</span>')
+        else:
+            parts.append(f"<b>{name}</b>")
+
+        if import_path:
+            ext = os.path.splitext(import_path)[1].upper().lstrip(".")
+            parts.append(f"from {os.path.basename(import_path)} ({ext})")
+        else:
+            parts.append("1 blank slide")
+
+        if script_path:
             try:
-                for item in os.listdir(project_path):
-                    existing_items.append(item)
-            except OSError:
-                existing_items = ["(unable to read directory)"]
+                content = self._read_file_text(script_path).strip()
+                sections = self._parse_script_sections(content)
+                action = "replace" if self.chk_override_text.isChecked() else "fill"
+                parts.append(f"script: {len(sections)} section(s), {action}")
+            except Exception:
+                parts.append(f"script: {os.path.basename(script_path)} (read error)")
 
-            has_slides = any(
-                item.startswith("slide") and item.endswith(".html")
-                for item in existing_items
-            )
-            has_audio = any(
-                item.endswith(".wav") for item in existing_items
-            )
-            has_images = any(
-                item == "images" for item in existing_items
-            )
-            has_manifest = "manifest.json" in existing_items
+        res_text = self.resolution_combo.currentText().split("(")[0].strip()
+        parts.append(res_text)
 
-            # Describe existing content
-            parts = []
-            if has_slides:
-                slide_count = sum(
-                    1 for i in existing_items
-                    if i.startswith("slide") and i.endswith(".html")
-                )
-                parts.append(f"  • {slide_count} slide(s)")
-            if has_audio:
-                wav_count = sum(
-                    1 for i in existing_items if i.endswith(".wav")
-                )
-                parts.append(f"  • {wav_count} audio file(s)")
-            if has_images:
-                parts.append("  • Images folder")
-            if has_manifest:
-                parts.append("  • Manifest (render history)")
+        self.summary_label.setText("  ·  ".join(parts))
+        self.btn_create.setEnabled(bool(name))
 
-            content_summary = "\n".join(parts) if parts else "  (empty folder)"
+    # ══════════════════════════════════════════════════════════════════════
+    #  PROJECT CREATION
+    # ══════════════════════════════════════════════════════════════════════
 
-            # Offer choices
-            msg = QMessageBox(self)
-            msg.setWindowTitle("Project Already Exists")
-            msg.setText(
-                f"A project folder '{project_name}' already exists.\n\n"
-                f"Contents:\n{content_summary}\n\n"
-                f"What would you like to do?"
-            )
-
-            btn_clean = msg.addButton(
-                "🔄 Clean Override\n(delete everything, start fresh)",
-                QMessageBox.ButtonRole.AcceptRole
-            )
-            btn_append = msg.addButton(
-                "➕ Append\n(add new slides to existing project)",
-                QMessageBox.ButtonRole.ActionRole
-            )
-            btn_cancel = msg.addButton(
-                "Cancel",
-                QMessageBox.ButtonRole.RejectRole
-            )
-
-            msg.setDefaultButton(btn_cancel)
-            msg.exec()
-
-            clicked = msg.clickedButton()
-
-            if clicked == btn_cancel:
-                return
-
-            elif clicked == btn_clean:
-                # ── CLEAN OVERRIDE: Remove everything ──
-                confirm = QMessageBox.question(
-                    self, "Confirm Clean Override",
-                    f"This will permanently DELETE all contents of:\n"
-                    f"{project_path}\n\n"
-                    f"Including slides, audio files, images, and render history.\n\n"
-                    f"Are you sure?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No
-                )
-                if confirm != QMessageBox.StandardButton.Yes:
-                    return
-
-                try:
-                    shutil.rmtree(project_path)
-                    logger.info(f"[NewProject] Cleaned existing project: {project_path}")
-                except Exception as e:
-                    QMessageBox.critical(
-                        self, "Error",
-                        f"Could not remove existing project: {e}")
-                    return
-
-            elif clicked == btn_append:
-                # ── APPEND: Keep existing, just add new slides ──
-                # Nothing to delete, we'll add slides after the existing ones
-                pass
-
-        # ══════════════════════════════════════════════════════════
-        # CREATE PROJECT DIRECTORY (if it doesn't exist)
-        # ══════════════════════════════════════════════════════════
-        try:
-            os.makedirs(project_path, exist_ok=True)
-        except OSError as e:
-            QMessageBox.critical(
-                self, "Error",
-                f"Could not create project directory: {e}")
+    def _create_project(self):
+        name = self.name_edit.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Missing Name", "Please enter a project name.")
             return
 
-        # ══════════════════════════════════════════════════════════
-        # PDF IMPORT (creates slides from PDF pages)
-        # ══════════════════════════════════════════════════════════
-        if pdf_import_requested:
-            pdf_path = self.pdf_path_edit.text().strip()
-            self._auto_adjust_orientation_for_pdf(pdf_path)
-            if os.path.exists(pdf_path):
-                try:
-                    import fitz  # Check early
-                except ImportError:
-                    QMessageBox.critical(
-                        self, "Missing Dependency",
-                        "PyMuPDF is required for PDF import.\n\n"
-                        "Install via: pip install PyMuPDF"
-                    )
-                    return
+        self._set_ui_enabled(False)
 
-                try:
-                    config_dict = (
-                        self.config.settings
-                        if hasattr(self.config, 'settings')
-                        else self.config
-                    )
-
-                    # Check if this is a fresh project or append
-                    import glob as _glob
-                    existing_html = _glob.glob(
-                        os.path.join(project_path, "slide*.html"))
-
-                    if existing_html:
-                        # Append mode: add PDF pages after existing slides
-                        count = import_pdf_append(
-                            pdf_path, project_path, config_dict)
-                    else:
-                        # Fresh project: PDF pages become the slides
-                        count = import_pdf_as_project(
-                            pdf_path, project_path, config_dict)
-
-                    logger.info(
-                        f"[NewProject] Imported {count} slides from PDF "
-                        f"into '{project_name}'")
-
-                    # Success — notify and clean up UI
-                    if self.on_project_created:
-                        self.on_project_created(project_path)
-
-                    def _do_refresh():
-                        parent = self.parent()
-                        while parent:
-                            if hasattr(parent, 'tabs'):
-                                for i in range(parent.tabs.count()):
-                                    w = parent.tabs.widget(i)
-                                    if (isinstance(w, SlideEditorTabWidget) and 
-                                            w.project_path == project_path):
-                                        w.refresh_from_disk()
-                                        break
-                            parent = parent.parent()
-                    QTimer.singleShot(200, _do_refresh)
-
-                    self.name_input.clear()
-                    self.content_input.clear()
-                    self.name_input.setFocus()
-                    self.type_combo.setCurrentIndex(0)
-
-                    QMessageBox.information(
-                        self, "PDF Imported",
-                        f"Project '{project_name}' created with "
-                        f"{count} slide(s) from PDF.")
-
-                    return  # Done — skip default slide creation
-
-                except Exception as e:
-                    logger.exception("PDF import failed")
-                    QMessageBox.critical(
-                        self, "Import Error",
-                        f"PDF import failed:\n{e}\n\n"
-                        f"A default slide will be created instead.")
-                    # Fall through to create a default slide
-
-        # ══════════════════════════════════════════════════════════
-        # DEFAULT SLIDE CREATION (no PDF, or PDF failed)
-        # ══════════════════════════════════════════════════════════
         try:
-            slide_type = self.type_combo.currentText()
-            content = self.content_input.text()
+            is_import = self.radio_import.isChecked()
+            import_path = self.import_path_edit.text().strip() if is_import else ""
+            script_path = self.script_path_edit.text().strip()
 
-            # Find next available slide number (for append support)
-            import glob as _glob
-            existing = _glob.glob(
-                os.path.join(project_path, "slide*.html"))
-            if existing:
-                slide_num = get_next_slide_number(project_path)
+            if is_import and import_path and not os.path.isfile(import_path):
+                raise ValueError(f"Import file not found: {import_path}")
+            if script_path and not os.path.isfile(script_path):
+                raise ValueError(f"Script file not found: {script_path}")
+
+            # ── Create base project ───────────────────────────────────────
+            on_exists = "error"  # default
+            if import_path:
+                # Check if project already exists and ask the user
+                projects_root = self.config.get("projects_root", "Projects")
+                if not os.path.isabs(projects_root):
+                    projects_root = os.path.join(AppConfig.APP_ROOT, projects_root)
+                candidate_path = os.path.join(projects_root, name)
+                if os.path.exists(candidate_path):
+                    on_exists = _ask_overwrite_or_append(self, name)
+                    if on_exists is None:
+                        self._set_ui_enabled(True)
+                        return  # User cancelled
+                logger.info(
+                    f"[NewProject] Importing '{os.path.basename(import_path)}' as '{name}'"
+                )
+                project_path = import_file_as_project(
+                    import_path, self.config.settings, project_name=name,
+                    on_exists=on_exists,
+                )
             else:
-                slide_num = 1
+                projects_root = self.config.get("projects_root", "Projects")
+                if not os.path.isabs(projects_root):
+                    projects_root = os.path.join(AppConfig.APP_ROOT, projects_root)
+                project_path = os.path.join(projects_root, name)
 
-            html_path = os.path.join(
-                project_path, f"slide{slide_num}.html")
-            txt_path = os.path.join(
-                project_path, f"slide{slide_num}.txt")
+                if os.path.exists(project_path):
+                    on_exists = _ask_overwrite_or_append(self, name)
+                    if on_exists is None:
+                        self._set_ui_enabled(True)
+                        return  # User cancelled
+                    if on_exists == "overwrite":
+                        shutil.rmtree(project_path)
+                    elif on_exists == "append":
+                        # Keep existing project, just apply script later
+                        pass
 
-            if slide_type == "Text Slide":
-                create_slide_file(
-                    html_path, get_default_slide_html(content))
-                with open(txt_path, "w", encoding="utf-8") as f:
-                    f.write(content)
-
-            elif slide_type == "Image Slide":
-                if content and os.path.exists(content):
-                    try:
-                        # Copy image to project and create proper slide
-                        images_dir = os.path.join(project_path, "images")
-                        os.makedirs(images_dir, exist_ok=True)
-                        
-                        ext = os.path.splitext(content)[1].lower()
-                        if ext not in ('.png', '.jpg', '.jpeg', '.gif',
-                                       '.bmp', '.webp', '.tiff'):
-                            ext = '.png'
-                        
-                        image_filename = f"slide_{slide_num}{ext}"
-                        dest = os.path.join(images_dir, image_filename)
-                        shutil.copy2(content, dest)
-                        
-                        # Use relative path in HTML
-                        image_relative = f"images/{image_filename}"
-                        create_slide_file(
-                            html_path,
-                            get_image_slide_html(image_relative, project_path))
-                    except ImportError:
-                        create_slide_file(
-                            html_path,
-                            f"<html><body>"
-                            f"<img src='file:///{content}'>"
-                            f"</body></html>")
-
-                    with open(txt_path, "w", encoding="utf-8") as f:
-                        f.write("")  # Silent by default for image slides
+                if on_exists != "append" or not os.path.exists(project_path):
+                    os.makedirs(project_path, exist_ok=True)
+                    initialize_project_files(project_path)
+                    logger.info(f"[NewProject] Created blank project: {name}")
                 else:
-                    create_slide_file(
-                        html_path, get_blank_slide_html("#000000"))
-                    with open(txt_path, "w", encoding="utf-8") as f:
-                        f.write("")
+                    logger.info(f"[NewProject] Appending to existing project: {name}")
 
-            elif slide_type == "Blank Slide":
-                create_slide_file(
-                    html_path, get_blank_slide_html("#000000"))
+            # ── Apply resolution ──────────────────────────────────────────
+            res_name = self.resolution_combo.currentText()
+            width, height = AppConfig.RESOLUTION_PRESETS.get(res_name, (1280, 720))
+            self.config.set_resolution(width, height)
+
+            # ── Apply speaker script ──────────────────────────────────────
+            if script_path:
+                updated = self._apply_speaker_script(project_path, script_path)
+                logger.info(
+                    f"[NewProject] Applied narration script: {updated} slide(s) updated"
+                )
+
+            # ── Callback & close ──────────────────────────────────────────
+            if self._on_created:
+                self._on_created(project_path)
+            self._close_tab()
+
+        except ImportError as exc:
+            logger.error(f"[NewProject] Missing library: {exc}")
+            QMessageBox.critical(self, "Missing Library", str(exc))
+            self._set_ui_enabled(True)
+        except ValueError as exc:
+            logger.warning(f"[NewProject] Invalid input: {exc}")
+            QMessageBox.warning(self, "Input Error", str(exc))
+            self._set_ui_enabled(True)
+        except Exception as exc:
+            logger.error(f"[NewProject] Failed: {exc}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to create project:\n{exc}")
+            self._set_ui_enabled(True)
+
+    def _set_ui_enabled(self, enabled: bool):
+        """Toggle all interactive elements."""
+        creating = not enabled
+        self.btn_create.setEnabled(enabled)
+        self.btn_create.setText("Creating…" if creating else "Create")
+        for w in (
+            self.name_edit, self.radio_blank, self.radio_import,
+            self.import_path_edit, self.import_browse_btn,
+            self.script_path_edit, self.script_browse_btn,
+            self.chk_override_text, self.resolution_combo,
+            self.btn_cancel,
+        ):
+            w.setEnabled(enabled)
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  SPEAKER SCRIPT ENGINE
+    # ══════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _read_file_text(file_path: str) -> str:
+        """Read text content from a script file. Supports PDF, TXT, CSV, and JSON."""
+        ext = os.path.splitext(file_path)[1].lower()
+        
+        if ext == ".pdf":
+            try:
+                import fitz  # PyMuPDF
+            except ImportError:
+                raise ImportError(
+                    "PyMuPDF is required to read PDF scripts. "
+                    "Install with: pip install PyMuPDF"
+                )
+            doc = fitz.open(file_path)
+            text = "\n\n".join(page.get_text() for page in doc)
+            doc.close()
+            return text
+            
+        elif ext == ".json":
+            # Delegate to the proper parser so that structured speaker-script
+            # JSON (with a "slides" array) is handled correctly.  The old code
+            # joined top-level keys, which turned a 12-slide JSON into 3
+            # sections (one per top-level key).
+            try:
+                from utils import parse_speaker_script_json
+                parsed = parse_speaker_script_json(file_path)
+                # Join each slide's content with double-newlines so that
+                # _parse_script_sections() can split them properly.
+                return "\n\n".join(
+                    slide["content"] for slide in parsed["slides"]
+                )
+            except ValueError:
+                # Not a speaker-script JSON — fall back to generic dump
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    return "\n\n".join(
+                        item if isinstance(item, str) else json.dumps(item)
+                        for item in data
+                    )
+                elif isinstance(data, dict):
+                    return "\n\n".join(
+                        f"{k}: {v}" if isinstance(v, str) else f"{k}: {json.dumps(v)}"
+                        for k, v in data.items()
+                    )
+                return str(data)
+            
+        else:  # .txt, .csv, or anything else -> read as plain text
+            with open(file_path, "r", encoding="utf-8") as f:
+                return f.read()
+
+    @staticmethod
+    def _parse_script_sections(content: str) -> list[str]:
+        """Split script into sections. Supports blank-line separation and
+        labeled format:  Slide 1: text"""
+        if not content or not content.strip():
+            return []
+        labeled = re.findall(
+            r"^Slide\s+\d+\s*[:.)]\s*(.+)$",
+            content.strip(), re.MULTILINE | re.IGNORECASE,
+        )
+        if labeled:
+            return [s.strip() for s in labeled if s.strip()]
+        sections = re.split(r"\n\s*\n", content.strip())
+        return [s.strip() for s in sections if s.strip()]
+
+    def _apply_speaker_script(self, project_path: str, script_path: str) -> int:
+        """Apply narration script to slide .txt files. Creates extra slides
+        if the script has more sections than existing slides."""
+        content = self._read_file_text(script_path)
+
+        sections = self._parse_script_sections(content)
+        if not sections:
+            logger.warning("[NewProject] Speaker script is empty")
+            return 0
+
+        override = self.chk_override_text.isChecked()
+        txt_files = sorted(
+            glob.glob(os.path.join(project_path, "slide*.txt")),
+            key=natural_sort_key,
+        )
+        updated = 0
+
+        # Update existing slides
+        for i, txt_file in enumerate(txt_files):
+            if i >= len(sections):
+                break
+            should_write = False
+            if override:
+                should_write = True
+            else:
+                try:
+                    existing = Path(txt_file).read_text(encoding="utf-8").strip()
+                    should_write = not existing
+                except Exception:
+                    should_write = True
+            if should_write:
+                with open(txt_file, "w", encoding="utf-8") as f:
+                    f.write(sections[i])
+                updated += 1
+
+        # Create additional slides for extra sections
+        if len(sections) > len(txt_files):
+            next_num = get_next_slide_number(project_path)
+            for i in range(len(txt_files), len(sections)):
+                slide_num = next_num + (i - len(txt_files))
+                html_path = os.path.join(project_path, f"slide{slide_num}.html")
+                txt_path = os.path.join(project_path, f"slide{slide_num}.txt")
+                # FIX: get_default_slide_html requires (title, text)
+                html_content = get_default_slide_html(
+                    f"Slide {slide_num}", sections[i]
+                )
+                with open(html_path, "w", encoding="utf-8") as f:
+                    f.write(html_content)
                 with open(txt_path, "w", encoding="utf-8") as f:
-                    f.write("")
+                    f.write(sections[i])
+                updated += 1
 
-            if self.on_project_created:
-                self.on_project_created(project_path)
+        return updated
 
-            self.name_input.clear()
-            self.content_input.clear()
-            self.name_input.setFocus()
-            self.type_combo.setCurrentIndex(0)
+    # ══════════════════════════════════════════════════════════════════════
+    #  TAB MANAGEMENT
+    # ══════════════════════════════════════════════════════════════════════
 
-            QMessageBox.information(
-                self, "Success",
-                f"Project '{project_name}' created successfully!")
+    def _cancel(self):
+        self._close_tab()
 
-        except Exception as e:
-            logger.exception("Failed to create project")
-            QMessageBox.critical(
-                self, "Error", f"Failed to create project: {e}")
-
+    def _close_tab(self):
+        parent = self.parent()
+        while parent is not None:
+            if isinstance(parent, QTabWidget):
+                for i in range(parent.count()):
+                    if parent.widget(i) is self:
+                        parent.removeTab(i)
+                        self.deleteLater()
+                        return
+            parent = parent.parent()
+        self.hide()
+        self.deleteLater()
 
 # =================================================================
 # SLIDE LIST PANEL (Modular Sub-Component)
@@ -2112,8 +2257,6 @@ class SlidePreviewPanel(QWidget):
     Scaling is applied via CSS zoom on the page body.
     """
 
-    SLIDE_W = 1280
-    SLIDE_H = 720
     PRESET_SCALES = ["Fit", "25%", "50%", "75%", "100%", "125%", "150%", "200%"]
 
     def __init__(self, config, parent=None):
@@ -2186,7 +2329,7 @@ class SlidePreviewPanel(QWidget):
         self.btn_zoom_in.setToolTip("Zoom in (+25%)")
         self.btn_zoom_in.clicked.connect(lambda: self._step_scale(25))
 
-        self.lbl_info = QLabel(f"{self.SLIDE_W} x {self.SLIDE_H}")
+        self.lbl_info = QLabel(f"{self.config.get('width', 1280)} x {self.config.get('height', 720)}")
 
         tb.addWidget(self.btn_fit)
         tb.addStretch()
@@ -2241,7 +2384,7 @@ class SlidePreviewPanel(QWidget):
         # Also update the viewport size immediately
         if hasattr(self, 'webview') and hasattr(self.webview, 'page'):
             try:
-                self.webview.page().setViewportSize(
+                self.webview.resize(
                     QSize(self._preview_base_width, self._preview_base_height)
                 )
             except Exception as e:
@@ -2295,7 +2438,7 @@ class SlidePreviewPanel(QWidget):
                     """
             
             # Set viewport to actual project resolution
-            self.webview.page().setViewportSize(
+            self.webview.resize(
                 QSize(config_w, config_h)
             )
         
@@ -2318,8 +2461,8 @@ class SlidePreviewPanel(QWidget):
         vh = self.webview.height()
         if vw <= 0 or vh <= 0:
             return
-        scale_w = vw / self.SLIDE_W
-        scale_h = vh / self.SLIDE_H
+        scale_w = vw / self.config.get('width', 1280 )
+        scale_h = vh / self.config.get('height', 720 )
         factor = min(scale_w, scale_h)
         percent = max(10, int(factor * 100))
         self._fit_mode = True
@@ -2341,6 +2484,40 @@ class SlidePreviewPanel(QWidget):
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    # Optional: keep the preview visually compact while keeping the internal
+    # viewport at the target render resolution
+    def _set_viewport_size(page, view, width, height):
+        size = QSize(width, height)
+        
+        # Try the "ideal" methods first (render at full res, display small)
+        if hasattr(page, 'setViewportSize'):
+            try:
+                page.setViewportSize(size)
+                return True
+            except Exception:
+                pass
+        try:
+            page.setProperty("viewportSize", size)
+            if page.viewportSize() == size:
+                return True
+        except Exception:
+            pass
+
+        # Fallback: resize widget, then scale it down visually
+        try:
+            view.setFixedSize(size)
+            # Scale the widget to fit a reasonable preview area
+            # (e.g., max 480px wide, maintaining aspect ratio)
+            preview_max_w = 480
+            if width > preview_max_w:
+                scale = preview_max_w / width
+                view.setFixedSize(int(width * scale), int(height * scale))
+            return True
+        except Exception:
+            pass
+
+        return False
 
     def _apply_zoom(self, percent: int):
         """Apply CSS zoom to the page body via JavaScript."""
@@ -2461,7 +2638,7 @@ class SlidePreviewPanel(QWidget):
         
         # Set viewport to the configured resolution
         if hasattr(self, '_preview_base_width') and hasattr(self, '_preview_base_height'):
-            self.webview.page().setViewportSize(
+            self.webview.resize(
                 QSize(self._preview_base_width, self._preview_base_height)
             )
         

@@ -15,7 +15,6 @@ FEATURES:
 import os
 import gc
 import logging
-import torch
 import numpy as np
 import glob
 import wave
@@ -57,9 +56,9 @@ from PySide6.QtWidgets import (
 )
 
 from PySide6.QtCore import QTimer, Qt
-
+import importlib.util
 from backends.base import BaseTTSBackend
-from utils import logger
+logger = logging.getLogger(__name__)
 
 
 class Qwen3Backend(BaseTTSBackend):
@@ -97,6 +96,11 @@ class Qwen3Backend(BaseTTSBackend):
             "modes": Qwen3Backend.QWEN3_MODES,
             "languages": Qwen3Backend.QWEN3_LANGUAGES
         }
+    
+    @classmethod
+    def is_available(cls) -> bool:
+        """Check if PyTorch is installed WITHOUT importing it (saves ~1GB RAM)."""
+        return importlib.util.find_spec("torch") is not None
 
     # =================================================================
     # HELPER: DYNAMIC MODEL ID
@@ -393,6 +397,9 @@ class Qwen3Backend(BaseTTSBackend):
             raise RuntimeError("Qwen3 library (qwen-tts) is not installed.")
 
     def initialize(self):
+        import torch
+        import transformers
+    
         if self.model is not None:
             self.cleanup()
             

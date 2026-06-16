@@ -213,5 +213,10 @@
         "path": "Projects\\ShortsHumanEyeAnatomy",
         "status": "ready",
         "last_render": 1780786824.0
+    },
+    "test": {
+        "path": "Projects\\test",
+        "status": "ready",
+        "last_render": 1781322614.0
     }
 }

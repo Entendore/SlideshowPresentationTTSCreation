@@ -34,9 +34,9 @@ from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QPushButton, QFileDialog, QPlainTextEdit
 )
 from PySide6.QtCore import QTimer, Qt
-
+import importlib.util
 from backends.base import BaseTTSBackend
-from utils import logger
+logger = logging.getLogger(__name__)
 
 
 class OmniVoiceBackend(BaseTTSBackend):
@@ -83,6 +83,11 @@ class OmniVoiceBackend(BaseTTSBackend):
             "modes": OmniVoiceBackend.OMNIVOICE_MODES,
             "languages": OmniVoiceBackend.OMNIVOICE_LANGUAGE_NAMES,
         }
+    
+    @classmethod
+    def is_available(cls) -> bool:
+        """Check if PyTorch is installed WITHOUT importing it."""
+        return importlib.util.find_spec("torch") is not None
 
     # =================================================================
     # UI GENERATION FACTORY
@@ -268,6 +273,9 @@ class OmniVoiceBackend(BaseTTSBackend):
     def initialize(self):
         """Validate configuration and log system info."""
         logger.info("[OmniVoiceBackend] Initializing...")
+
+        import torch
+        import transformers
 
         mode = self.config.get("omnivoice_mode", "auto")
         model_id = self.config.get("omnivoice_model_id", "k2-fsa/OmniVoice")
